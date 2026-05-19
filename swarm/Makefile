@@ -60,7 +60,8 @@ endif
 
 # ── Image management ──────────────────────────────────────────────────────────
 
-pull: $(COMPOSE_FILE)
+pull:
+	@[ -f $(COMPOSE_FILE) ] || $(MAKE) generate
 	$(COMPOSE) pull
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
