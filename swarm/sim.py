@@ -85,7 +85,7 @@ def _parse_args() -> argparse.Namespace:
     )
     run_p.add_argument("--mission", default=None, help="Override mission file path (unused; future).")
     run_p.add_argument("--rate-hz", type=float, default=5.0, help="Attack send rate in Hz.")
-    run_p.add_argument("--iface", default="any", help="Network interface to sniff.")
+    run_p.add_argument("--iface", default=None, help="(deprecated — ignored; kept for backwards compat)")
     run_p.add_argument("--output", default=None, help="Override output directory path.")
     run_p.add_argument(
         "--keep-up",
@@ -112,8 +112,10 @@ def _preflight_checks() -> None:
         log.error("docker not found on PATH. Please install Docker.")
         sys.exit(1)
 
-    if shutil.which("tcpdump") is None:
-        log.error("tcpdump not found on PATH. Run: sudo apt-get install tcpdump")
+    try:
+        import pymavlink.mavutil  # noqa: F401
+    except ImportError:
+        log.error("pymavlink is not installed. Run: pip install pymavlink")
         sys.exit(1)
 
     try:
@@ -122,14 +124,8 @@ def _preflight_checks() -> None:
         log.error("scapy is not installed. Run: pip install scapy")
         sys.exit(1)
 
-    try:
-        import pymavlink.mavutil  # noqa: F401
-    except ImportError:
-        log.error("pymavlink is not installed. Run: pip install pymavlink")
-        sys.exit(1)
-
     if os.getuid() != 0:
-        log.warning("Not running as root — scapy may fail to open raw sockets.")
+        log.warning("Not running as root — scapy attacks require raw socket access (sudo).")
 
 
 # ---------------------------------------------------------------------------
@@ -549,12 +545,7 @@ def main() -> int:
         ]
         labels = LabelLookup(windows)
         writer = PacketWriter(output_dir / "csv", labels)
-        sniffer = start_sniffer(
-            args.iface,
-            [14540, 14550, 5760],
-            writer,
-            pcap_path=output_dir / "capture.pcap",
-        )
+        sniffer = start_sniffer(list(range(1, args.size + 1)), writer)
         log.info("Capture started (epoch %.3f).", capture_start_epoch)
 
         # Phase 7: push all drones through GCS flight stages in parallel.
