@@ -1,8 +1,15 @@
 """Live packet capture feeding MAVLink messages to a :class:`PacketWriter`.
 
-Uses scapy's ``AsyncSniffer`` to capture UDP/TCP traffic on nominated ports,
-parse embedded MAVLink frames with pymavlink, and write each decoded message
-via :class:`~swarm.dataset.packet_writer.PacketWriter`.
+Spawns ``tcpdump -i <iface>`` as a subprocess writing pcap to stdout, then
+parses frames with scapy's ``PcapReader``. This is the only reliable way to
+capture from a Linux ``any`` pseudo-interface — scapy's own ``get_if_list()``
+does not enumerate docker per-network bridges (``br-*``), and binding to a
+list of veth endpoints misses traffic that flows entirely through a bridge.
+
+The same physical packet typically appears 2–3 times on ``-i any`` (once per
+veth endpoint of a bridge, plus once on the bridge itself), so the reader
+fingerprints each frame by ``(src, dst, ip.id, proto, sport, dport, len)``
+and skips duplicates within a short window.
 
 Drone IDs are inferred from the ``10.13.<N>.<x>`` subnet convention: the
 ``<N>`` octet of whichever endpoint (src or dst) matches this pattern becomes
@@ -19,17 +26,21 @@ Usage::
 
 from __future__ import annotations
 
+import collections
+import logging
 import re
+import shutil
+import subprocess
+import threading
 from threading import Lock
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from pymavlink.mavutil import mavlink
 
 from .dvdsh_compat import IP_HEADER_FIELDS, TCP_HEADER_FIELDS, UDP_HEADER_FIELDS
 from .packet_writer import PacketWriter
 
-if TYPE_CHECKING:
-    pass  # AsyncSniffer imported at runtime to avoid scapy startup cost
+log = logging.getLogger("swarm.dataset.sniffer")
 
 # ---------------------------------------------------------------------------
 # Regex for extracting drone id from IP address.
@@ -179,43 +190,130 @@ def _extract_drone_id(src_ip: str, dst_ip: str) -> int | None:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def _packet_fingerprint(pkt: Any, IP: Any, UDP: Any, TCP: Any) -> tuple[Any, ...] | None:
+    """Compute a dedup key for a captured frame.
+
+    ``-i any`` shows the same wire packet multiple times (once per veth
+    endpoint plus once on the docker bridge). The IP id is set by the
+    sending host and persists across all observation points, so combining
+    it with src/dst/proto and L4 port info uniquely identifies a logical
+    packet within a short time window.
+
+    Args:
+        pkt: Scapy packet object.
+        IP: scapy IP layer class.
+        UDP: scapy UDP layer class.
+        TCP: scapy TCP layer class.
+
+    Returns:
+        A hashable tuple, or ``None`` for non-IP frames.
+    """
+    if IP not in pkt:
+        return None
+    ip = pkt[IP]
+    if UDP in pkt:
+        u = pkt[UDP]
+        return (ip.src, ip.dst, ip.id, ip.proto, u.sport, u.dport, u.len)
+    if TCP in pkt:
+        t = pkt[TCP]
+        return (ip.src, ip.dst, ip.id, ip.proto, t.sport, t.dport, t.seq, t.ack)
+    return (ip.src, ip.dst, ip.id, ip.proto)
+
+
+class _SnifferHandle:
+    """Lightweight handle returned by :func:`start_sniffer`.
+
+    Mirrors the subset of scapy ``AsyncSniffer`` we use elsewhere: a
+    ``stop()`` method that terminates the underlying tcpdump subprocess
+    and joins the reader thread.
+    """
+
+    def __init__(self, proc: subprocess.Popen[bytes], thread: threading.Thread) -> None:
+        self._proc = proc
+        self._thread = thread
+        self._stopped = False
+
+    def stop(self) -> None:
+        """Terminate tcpdump and wait briefly for the reader thread."""
+        if self._stopped:
+            return
+        self._stopped = True
+        try:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=2)
+        except Exception as exc:
+            log.warning("tcpdump terminate failed: %s", exc)
+        self._thread.join(timeout=5)
+
+
 def start_sniffer(
     iface: str,
     ports: list[int],
     writer: PacketWriter,
-) -> Any:
-    """Start an async packet sniffer and return the running ``AsyncSniffer``.
+) -> _SnifferHandle:
+    """Start a tcpdump-backed packet sniffer and return a stoppable handle.
 
     Captures UDP and TCP traffic on *ports* from *iface*, decodes embedded
     MAVLink frames, and calls ``writer.handle`` for each complete message.
-    Non-IP packets (e.g. ARP) are silently skipped.
-
-    The caller is responsible for calling ``sniffer.stop()`` when capture
-    should end.
+    Duplicate frames (same packet seen on multiple interfaces under ``-i
+    any``) are dropped via a recent-fingerprint set.
 
     Args:
-        iface: Network interface name to sniff (e.g. ``"any"`` or ``"eth0"``).
+        iface: Interface name to sniff. ``"any"`` is preferred on Linux —
+            tcpdump handles it natively, unlike scapy's ``AsyncSniffer``.
         ports: List of UDP/TCP port numbers to capture.
-        writer: :class:`~swarm.dataset.packet_writer.PacketWriter` instance that
-            receives each decoded MAVLink message.
+        writer: :class:`~swarm.dataset.packet_writer.PacketWriter` instance
+            that receives each decoded MAVLink message.
 
     Returns:
-        A started scapy ``AsyncSniffer`` instance.
+        A :class:`_SnifferHandle` exposing ``.stop()``.
+
+    Raises:
+        RuntimeError: When ``tcpdump`` is not on PATH or fails to start.
     """
-    from scapy.all import AsyncSniffer, IP, TCP, UDP  # local import: avoid scapy init at module level
+    # Local imports keep scapy initialisation off the module-load path.
+    from scapy.layers.inet import IP, TCP, UDP
+    from scapy.utils import PcapReader
+
+    if shutil.which("tcpdump") is None:
+        raise RuntimeError("tcpdump not found on PATH — install it (apt-get install tcpdump)")
 
     bpf_parts = [f"udp port {p} or tcp port {p}" for p in ports]
     bpf_filter = " or ".join(bpf_parts)
 
-    def _prn(pkt: Any) -> None:
-        """Process one captured packet.
+    # -U flushes per packet (no kernel/userspace batching), -n disables DNS,
+    # -s 0 captures full payloads, -w - writes pcap to stdout.
+    cmd = ["tcpdump", "-i", iface, "-U", "-n", "-s", "0", "-w", "-", bpf_filter]
+    log.info("Starting capture: %s", " ".join(cmd))
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    if proc.stdout is None:
+        raise RuntimeError("tcpdump failed to provide stdout pipe")
 
-        Args:
-            pkt: Scapy packet object.
-        """
-        # Silently skip non-IP frames.
+    # Bounded recent-fingerprint set. ~5s of moderate MAVLink traffic fits
+    # comfortably in 8192 entries; oldest get evicted FIFO.
+    seen: collections.OrderedDict[tuple[Any, ...], None] = collections.OrderedDict()
+    seen_cap = 8192
+
+    def _handle_one(pkt: Any) -> None:
         if IP not in pkt:
             return
+
+        fp = _packet_fingerprint(pkt, IP, UDP, TCP)
+        if fp is not None:
+            if fp in seen:
+                return
+            seen[fp] = None
+            if len(seen) > seen_cap:
+                seen.popitem(last=False)
 
         ip = pkt[IP]
         ip_hdr = _ip_fields(ip)
@@ -245,13 +343,11 @@ def start_sniffer(
 
         parser = _get_parser(src_ip, src_port)
 
-        # Feed each byte through the per-flow MAVLink parser.
         with _parser_lock:
             for byte in payload_bytes:
                 result = parser.parse_char(bytes([byte]))
                 if result is None:
                     continue
-                # parse_char may return a list or a single message.
                 msgs = result if isinstance(result, list) else [result]
                 for msg in msgs:
                     if msg is None:
@@ -269,12 +365,16 @@ def start_sniffer(
                         # Never let a write error kill the capture loop.
                         pass
 
-    # "any" is a Linux pseudo-interface not available on all kernels/scapy
-    # versions. Fall back to sniffing across all enumerated interfaces.
-    from scapy.all import get_if_list
+    def _reader_loop() -> None:
+        try:
+            with PcapReader(proc.stdout) as pcap:  # type: ignore[arg-type]
+                for pkt in pcap:
+                    _handle_one(pkt)
+        except Exception as exc:
+            # Expected on stop() — proc.terminate closes the pipe.
+            log.debug("pcap reader exited: %s", exc)
 
-    effective_iface: str | list[str] = iface if iface != "any" else get_if_list()
+    thread = threading.Thread(target=_reader_loop, daemon=True, name="sniffer-pcap-reader")
+    thread.start()
 
-    sniffer = AsyncSniffer(iface=effective_iface, filter=bpf_filter, prn=_prn, store=False)
-    sniffer.start()
-    return sniffer
+    return _SnifferHandle(proc, thread)

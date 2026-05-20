@@ -112,6 +112,10 @@ def _preflight_checks() -> None:
         log.error("docker not found on PATH. Please install Docker.")
         sys.exit(1)
 
+    if shutil.which("tcpdump") is None:
+        log.error("tcpdump not found on PATH. Run: sudo apt-get install tcpdump")
+        sys.exit(1)
+
     try:
         import scapy.all  # noqa: F401
     except ImportError:

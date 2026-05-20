@@ -35,8 +35,12 @@ class LabelLookup:
 
     windows: list[AttackWindow] = field(default_factory=list)
 
-    def lookup(self, frame_epoch: float, drone_id: int | None) -> str:
-        """Return the active attack_type for (timestamp, drone_id), or '' if none.
+    def lookup(self, frame_epoch: float, drone_id: int | None) -> str | None:
+        """Return the active attack_type for (timestamp, drone_id), or ``None``.
+
+        ``None`` is rendered as ``"null"`` by :func:`packet_writer._format_cell`,
+        keeping the ``attack_type`` column visually consistent with every other
+        null cell in the CSV.
 
         Linear scan over ``self.windows``; efficient for the small number of
         windows expected in a typical capture schedule.
@@ -47,12 +51,12 @@ class LabelLookup:
                 non-MAVLink frames.
 
         Returns:
-            The ``attack_type`` string of the first matching window, or an
-            empty string if no window matches.
+            The ``attack_type`` string of the first matching window, or
+            ``None`` when no window applies.
         """
         if drone_id is None:
-            return ""
+            return None
         for w in self.windows:
             if w.start_epoch <= frame_epoch <= w.end_epoch and drone_id in w.target_drones:
                 return w.attack_type
-        return ""
+        return None
