@@ -206,18 +206,34 @@ def _probe_flask(n: int, timeout: float) -> bool:
 
 
 def _start_mavlink_router(n: int) -> None:
-    """POST to companion to start mavlink-routerd with TCP server on port 5760."""
+    """POST to companion to start mavlink-routerd with TCP server on port 5760.
+
+    The endpoint requires ``serial_device`` and ``baud_rate`` — without them
+    the handler crashes on ``serial_device + ":" + str(baud_rate)`` and silently
+    fails to launch the router, so we always send the companion's defaults
+    (matching ``companion-computer/interface/config.json``).
+
+    Raises:
+        RuntimeError: When the POST does not return HTTP 200.
+    """
     import requests
 
+    url = f"http://localhost:{3000 + n}/telemetry/start-telemetry"
+    payload = {
+        "serial_device": "/dev/ttyUSB0",
+        "baud_rate": 57600,
+        "enable_tcp_server": True,
+    }
     try:
-        requests.post(
-            f"http://localhost:{3000 + n}/telemetry/start-telemetry",
-            json={"enable_tcp_server": True},
-            timeout=5,
-        )
-        log.info("MAVLink router start requested for drone %d.", n)
+        resp = requests.post(url, json=payload, timeout=10)
     except Exception as exc:
-        log.warning("Could not start MAVLink router for drone %d: %s", n, exc)
+        raise RuntimeError(f"drone {n}: POST {url} failed: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"drone {n}: POST {url} returned {resp.status_code}: {resp.text[:200]}"
+        )
+    log.info("MAVLink router started for drone %d (%s).", n, resp.json().get("cmd", ""))
 
 
 def _probe_mavlink_tcp(n: int, timeout: float) -> bool:
