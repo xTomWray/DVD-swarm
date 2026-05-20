@@ -194,20 +194,37 @@ def _run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]
 # ---------------------------------------------------------------------------
 
 
-def _probe_one(n: int, timeout: float) -> bool:
-    """Check whether drone instance *n*'s MAVLink router is accepting connections.
+def _probe_flask(n: int, timeout: float) -> bool:
+    """Return True when the companion Flask app is reachable."""
+    import requests
 
-    Runs a TCP connect check to port 5760 on the companion computer from
-    *inside* the GCS container — the same network path that ``arm-and-takeoff.py``
-    uses. A successful connect means ``mavlink-routerd`` is up and the GCS
-    stages will not hit ``ConnectionRefused``.
+    try:
+        resp = requests.get(f"http://localhost:{3000 + n}/socket-health", timeout=timeout)
+        return resp.status_code == 200
+    except Exception:
+        return False
 
-    Args:
-        n: Drone instance number (1-based).
-        timeout: Per-command timeout in seconds.
 
-    Returns:
-        ``True`` when the connection succeeds.
+def _start_mavlink_router(n: int) -> None:
+    """POST to companion to start mavlink-routerd with TCP server on port 5760."""
+    import requests
+
+    try:
+        requests.post(
+            f"http://localhost:{3000 + n}/telemetry/start-telemetry",
+            json={"enable_tcp_server": True},
+            timeout=5,
+        )
+        log.info("MAVLink router start requested for drone %d.", n)
+    except Exception as exc:
+        log.warning("Could not start MAVLink router for drone %d: %s", n, exc)
+
+
+def _probe_mavlink_tcp(n: int, timeout: float) -> bool:
+    """Return True when TCP 5760 on the companion is accepting connections.
+
+    Runs from inside the GCS container — the same network path used by
+    ``arm-and-takeoff.py`` — so a pass here guarantees the GCS stages connect.
     """
     try:
         result = subprocess.run(
@@ -224,44 +241,66 @@ def _probe_one(n: int, timeout: float) -> bool:
         return False
 
 
-def _wait_for_swarm_ready(
+def _poll_until_ready(
+    probe: object,
     size: int,
-    per_instance_timeout: float = 2.0,
-    total_timeout: float = 30.0,
+    label: str,
+    per_timeout: float = 2.0,
+    total_timeout: float = 120.0,
 ) -> None:
-    """Block until all *size* drone GCS endpoints report readiness.
-
-    Polls all instances in parallel every ``per_instance_timeout`` seconds
-    until every instance is ready or *total_timeout* is exceeded.
+    """Poll *probe(n, per_timeout)* for all instances until all pass or timeout.
 
     Args:
-        size: Number of drone instances to wait for.
-        per_instance_timeout: Per-HTTP-request timeout in seconds.
-        total_timeout: Maximum total wait time in seconds.
+        probe: Callable ``(n: int, timeout: float) -> bool``.
+        size: Number of drone instances (1-based).
+        label: Human-readable name used in log messages.
+        per_timeout: Timeout passed to each probe call.
+        total_timeout: Maximum wall-clock seconds to wait overall.
 
     Raises:
-        TimeoutError: When not all instances become ready within *total_timeout*.
+        TimeoutError: When not all instances pass within *total_timeout*.
     """
     deadline = time.monotonic() + total_timeout
     pending = set(range(1, size + 1))
-    log.info("Waiting for %d drone(s) to become ready (budget %.0fs)…", size, total_timeout)
+    log.info("Waiting for %s on %d drone(s) (budget %.0fs)…", label, size, total_timeout)
 
     while pending and time.monotonic() < deadline:
         with ThreadPoolExecutor(max_workers=min(len(pending), 32)) as pool:
-            futures = {pool.submit(_probe_one, n, per_instance_timeout): n for n in pending}
+            futures = {pool.submit(probe, n, per_timeout): n for n in pending}
             for fut in as_completed(futures):
                 n = futures[fut]
                 if fut.result():
                     pending.discard(n)
-                    log.info("Drone %d ready.", n)
+                    log.info("Drone %d: %s ✓", n, label)
 
         if pending:
-            time.sleep(per_instance_timeout)
+            time.sleep(per_timeout)
 
     if pending:
-        raise TimeoutError(f"Timed out waiting for drone(s): {sorted(pending)}")
+        raise TimeoutError(f"Timed out waiting for {label} on drone(s): {sorted(pending)}")
 
-    log.info("All %d drones ready.", size)
+    log.info("All %d drones: %s ✓", size, label)
+
+
+def _wait_for_swarm_ready(size: int, per_instance_timeout: float, total_timeout: float) -> None:
+    """Bring the swarm to a state where GCS stages can run.
+
+    Three sequential phases:
+    1. Wait for companion Flask (``/socket-health`` → 200).
+    2. Trigger ``mavlink-routerd`` (POST ``/telemetry/start-telemetry``).
+    3. Wait for TCP 5760 on the companion to accept connections.
+
+    Args:
+        size: Number of drone instances.
+        per_instance_timeout: Per-probe timeout in seconds.
+        total_timeout: Budget for phase 1 and phase 3 each.
+    """
+    _poll_until_ready(_probe_flask, size, "companion Flask", per_instance_timeout, total_timeout)
+
+    for n in range(1, size + 1):
+        _start_mavlink_router(n)
+
+    _poll_until_ready(_probe_mavlink_tcp, size, "MAVLink TCP 5760", per_instance_timeout, total_timeout)
 
 
 # ---------------------------------------------------------------------------
