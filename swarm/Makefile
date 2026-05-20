@@ -3,7 +3,9 @@ COMPOSE_FILE  ?= docker-compose.$(STACK).yml
 PROJECT_NAME  ?= dvd-$(STACK)
 INSTANCES     ?=
 RAM_GB        ?= 16
-PYTHON        := python3
+# Prefer the project venv so sudo -E picks up the right Python version.
+_VENV_PY      := $(abspath ../.venv/bin/python3)
+PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
