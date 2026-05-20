@@ -20,7 +20,6 @@ import logging
 import math
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import threading
@@ -196,23 +195,27 @@ def _run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]
 
 
 def _probe_one(n: int, timeout: float) -> bool:
-    """Check whether drone instance *n*'s flight controller is ready.
+    """Check whether drone instance *n* has live MAVLink telemetry.
 
-    Opens a raw TCP connection to the FC's MAVLink port. A successful
-    connect means ArduPilot is listening; we don't need to wait for a
-    HEARTBEAT here (the GCS stages do that themselves).
+    Queries the companion computer's ``/telemetry/telemetry-status`` endpoint.
+    ``isTelemetryRunning: true`` means the companion has an active MAVLink
+    connection to the flight controller — the strongest available readiness
+    signal short of arming.
 
     Args:
         n: Drone instance number (1-based).
-        timeout: Connection timeout in seconds.
+        timeout: HTTP request timeout in seconds.
 
     Returns:
-        ``True`` when the TCP port accepts a connection.
+        ``True`` when telemetry is confirmed running.
     """
+    import requests
+
     try:
-        with socket.create_connection((f"10.13.{n}.2", 5760), timeout=timeout):
-            return True
-    except OSError:
+        url = f"http://localhost:{3000 + n}/telemetry/telemetry-status"
+        resp = requests.get(url, timeout=timeout)
+        return bool(resp.json().get("isTelemetryRunning", False))
+    except Exception:
         return False
 
 
