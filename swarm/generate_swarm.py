@@ -122,9 +122,9 @@ def _mem_limits(service: str) -> dict[str, str]:
     }
 
 
-def flight_controller_service(n: int) -> dict[str, Any]:
+def flight_controller_service(n: int, raw_dir: Path) -> dict[str, Any]:
     """Build the flight-controller-lite service definition for instance N."""
-    logs_path = str(Path(f"configs/data/raw/instance-{n}").resolve())
+    logs_path = str((raw_dir / f"instance-{n}").resolve())
     return {
         "image": IMAGES["flight-controller"],
         "container_name": f"flight-controller-lite-{n}",
@@ -205,13 +205,13 @@ def companion_computer_service(n: int, waypoints_dir: Path | None) -> dict[str, 
     }
 
 
-def ground_control_station_service(n: int) -> dict[str, Any]:
+def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
     """Build the ground-control-station-lite service definition for instance N.
 
     X11 display, GPU device, and WiFi are all stripped for headless operation.
     HEADLESS=1 instructs QGC to run without a display server.
     """
-    logs_path = str(Path(f"configs/data/raw/instance-{n}").resolve())
+    logs_path = str((raw_dir / f"instance-{n}").resolve())
     _stages = str(Path("ground-control-station/stages").resolve())
     _missions = str(Path("ground-control-station/missions").resolve())
     return {
@@ -278,16 +278,16 @@ def simulator_service(n: int) -> dict[str, Any]:
 
 
 def instance_services(
-    n: int, *, include_gcs: bool, waypoints_dir: Path | None
+    n: int, *, include_gcs: bool, waypoints_dir: Path | None, raw_dir: Path
 ) -> dict[str, dict[str, Any]]:
     """Return service definitions for instance N."""
     services: dict[str, dict[str, Any]] = {
-        f"flight-controller-lite-{n}": flight_controller_service(n),
+        f"flight-controller-lite-{n}": flight_controller_service(n, raw_dir),
         f"companion-computer-lite-{n}": companion_computer_service(n, waypoints_dir),
         f"simulator-lite-{n}": simulator_service(n),
     }
     if include_gcs:
-        services[f"ground-control-station-lite-{n}"] = ground_control_station_service(n)
+        services[f"ground-control-station-lite-{n}"] = ground_control_station_service(n, raw_dir)
     return services
 
 
@@ -381,6 +381,7 @@ def generate(
     start_index: int = 1,
     include_gcs: bool,
     waypoints_dir: Path | None,
+    raw_dir: Path,
 ) -> dict[str, Any]:
     """Build the full Compose document for n_instances DVD litemode stacks."""
     services: dict[str, Any] = {}
@@ -388,7 +389,9 @@ def generate(
     volumes: dict[str, Any] = {}
 
     for n in range(start_index, start_index + n_instances):
-        services.update(instance_services(n, include_gcs=include_gcs, waypoints_dir=waypoints_dir))
+        services.update(instance_services(
+            n, include_gcs=include_gcs, waypoints_dir=waypoints_dir, raw_dir=raw_dir,
+        ))
         networks[f"dvd-net-{n}"] = instance_network(n)
         volumes.update(instance_volumes(n))
 
@@ -484,6 +487,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="FILE",
         help="Output file path",
     )
+    parser.add_argument(
+        "--raw-dir",
+        type=Path,
+        default=Path("configs/data/raw"),
+        metavar="DIR",
+        help=(
+            "Host directory under which per-instance FC log dirs are created "
+            "and bind-mounted at /ardupilot/logs. Use a per-run path to avoid "
+            "root-owned files from one run blocking the next."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -541,8 +555,10 @@ def main(argv: list[str] | None = None) -> int:
     # Pre-create log directories with world-writable permissions.
     # ArduPilot runs as uid=1000 (ardupilot) inside the FC container; Docker
     # creates bind-mount directories as root:root 755 which blocks writes.
+    raw_dir = args.raw_dir
+    raw_dir.mkdir(parents=True, exist_ok=True)
     for i in range(start_index, end_index + 1):
-        log_dir = Path(f"configs/data/raw/instance-{i}")
+        log_dir = raw_dir / f"instance-{i}"
         log_dir.mkdir(parents=True, exist_ok=True)
         with suppress(PermissionError):
             log_dir.chmod(0o777)
@@ -552,6 +568,7 @@ def main(argv: list[str] | None = None) -> int:
         start_index=start_index,
         include_gcs=args.include_gcs,
         waypoints_dir=waypoints_dir,
+        raw_dir=raw_dir,
     )
 
     # Report which waypoints resolution each instance got

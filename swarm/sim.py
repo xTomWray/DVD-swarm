@@ -491,11 +491,18 @@ def main() -> int:
     # 1..N for readiness, GCS-exec, attack targets, and log collection. Using
     # --auto-start-index could shift the block on a host with existing DVD
     # containers and silently mis-target every per-drone phase.
+    # Per-run raw-data dir so FC logs from one run don't collide with the next
+    # (Docker writes inside the container as root, leaving root-owned files
+    # on the host bind-mount target).
+    raw_dir = (output_dir / "raw").resolve()
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
     _run([
         "python3", "swarm/generate_swarm.py",
         "--instances", str(args.size),
         "--start-index", "1",
         "--out", "docker-compose.swarm.yml",
+        "--raw-dir", str(raw_dir),
     ])
     _run([
         "docker", "compose",
@@ -621,8 +628,10 @@ def main() -> int:
             log.info("Writer closed. Row counts: %s", writer.counts)
 
         # Phase 12: collect ArduPilot flight-controller logs.
+        # Source is per-run raw_dir (output_dir/raw/instance-N) so we don't
+        # have to clean a shared configs/data/raw between runs.
         for n in range(1, args.size + 1):
-            src = Path(f"configs/data/raw/instance-{n}/")
+            src = raw_dir / f"instance-{n}"
             dst = output_dir / "logs" / f"instance-{n}"
             if src.exists():
                 shutil.copytree(src, dst, dirs_exist_ok=True)
