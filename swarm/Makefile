@@ -9,7 +9,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -28,6 +28,16 @@ help:
 	@echo "  make logs                      Stream logs from all instances"
 	@echo "  make sysctl-check              Warn if inotify limits may be too low"
 	@echo "  make sim N=100 START=10 END=1200 ATTACK=attitude-spoof    Full attack-cycle run"
+	@echo ""
+	@echo "  make sim-multi N=15 START=40 END=120 ATTACK=attitude_spoof RUNS=10"
+	@echo "      Run 'sim' RUNS times with identical parameters."
+	@echo ""
+	@echo "  make sim-random N=15 ATTACK=attitude_spoof RUNS=10 \\"
+	@echo "       [START_MIN=40 START_MAX=70 DUR_MIN=30 DUR_MAX=80 END=150]"
+	@echo "      Run RUNS sims with random attack-window timing per iteration."
+	@echo ""
+	@echo "  make sim-benign N=50 END=300 RUNS=5"
+	@echo "      Run RUNS benign-only captures (no attack, label=null on every row)."
 	@echo ""
 	@echo "Memory per instance: ~1.5 GB with GCS (default) | ~1 GB no GCS"
 	@echo "Recommended for 16 GB host: 9 instances (with GCS)  |  14 instances (no GCS)"
@@ -115,3 +125,58 @@ sim:
 	cd .. && $(PYTHON) -m swarm.sim run \
 	    --size $(SIZE) --start $(START) --end $(END) \
 	    --attack $(ATTACK)
+
+# ── Multi-run loops ───────────────────────────────────────────────────────────
+# Knobs:
+#   RUNS        How many iterations (default 5)
+#   N / SIZE    Swarm size per run
+#   START/END   Attack window (sim-multi uses these literally)
+#   START_MIN/START_MAX  Random START range for sim-random
+#   DUR_MIN/DUR_MAX      Random attack-duration range for sim-random
+#   ATTACK      Attack type (default: $(ATTACK))
+#
+# Each iteration calls back into `make sim` so the per-run params are visible
+# in the recipe log and a failed run halts the loop (||exit 1).
+
+RUNS       ?= 5
+START_MIN  ?= 40
+START_MAX  ?= 70
+DUR_MIN    ?= 30
+DUR_MAX    ?= 80
+
+# Run the same `sim` config RUNS times.
+sim-multi:
+	@if [ -z "$(SIZE)" ]; then echo "ERROR: pass N=<swarm size>"; exit 1; fi
+	@for i in $$(seq 1 $(RUNS)); do \
+	    echo "=== run $$i/$(RUNS)  N=$(SIZE) START=$(START) END=$(END) ATTACK=$(ATTACK) ==="; \
+	    $(MAKE) --no-print-directory sim \
+	        N=$(SIZE) START=$(START) END=$(END) ATTACK=$(ATTACK) || exit 1; \
+	done
+
+# Run RUNS sims, randomising attack window per iteration.
+# Each iteration draws START ∈ [START_MIN, START_MAX], duration ∈ [DUR_MIN, DUR_MAX],
+# computes END = START + duration (capped at $(END) so the mission generator sizes correctly).
+sim-random:
+	@if [ -z "$(SIZE)" ]; then echo "ERROR: pass N=<swarm size>"; exit 1; fi
+	@SPAN=$$(($(START_MAX) - $(START_MIN) + 1)); \
+	DSPAN=$$(($(DUR_MAX) - $(DUR_MIN) + 1)); \
+	for i in $$(seq 1 $(RUNS)); do \
+	    S=$$(( $(START_MIN) + RANDOM % $$SPAN )); \
+	    D=$$(( $(DUR_MIN)   + RANDOM % $$DSPAN )); \
+	    E=$$(( S + D )); \
+	    if [ $$E -gt $(END) ]; then E=$(END); fi; \
+	    echo "=== run $$i/$(RUNS)  N=$(SIZE) START=$$S END=$$E ATTACK=$(ATTACK) ==="; \
+	    $(MAKE) --no-print-directory sim \
+	        N=$(SIZE) START=$$S END=$$E ATTACK=$(ATTACK) || exit 1; \
+	done
+
+# Run RUNS benign-only captures. Every row in every drone's CSV gets
+# attack_type=null — useful for building a clean baseline before mixing
+# attack runs in. START is ignored under --attack none.
+sim-benign:
+	@if [ -z "$(SIZE)" ]; then echo "ERROR: pass N=<swarm size>"; exit 1; fi
+	@for i in $$(seq 1 $(RUNS)); do \
+	    echo "=== benign run $$i/$(RUNS)  N=$(SIZE) END=$(END) ==="; \
+	    $(MAKE) --no-print-directory sim \
+	        N=$(SIZE) START=0 END=$(END) ATTACK=none || exit 1; \
+	done

@@ -74,8 +74,9 @@ def _parse_args() -> argparse.Namespace:
     run_p.add_argument(
         "--attack",
         required=True,
-        choices=list(ATTACK_HANDLERS.keys()),
-        help="Attack type to inject.",
+        choices=list(ATTACK_HANDLERS.keys()) + ["none"],
+        help="Attack type to inject. Use 'none' for a benign-only capture "
+             "(every row labelled 'null' — useful for building a baseline).",
     )
     run_p.add_argument(
         "--targets",
@@ -526,14 +527,20 @@ def main() -> int:
             else list(range(1, args.size + 1))
         )
 
-        windows = [
-            AttackWindow(
-                start_epoch=capture_start_epoch + args.start,
-                end_epoch=capture_start_epoch + args.end,
-                target_drones=frozenset(target_ids),
-                attack_type=args.attack,
-            )
-        ]
+        # Benign-only runs use an empty window list — every row gets
+        # attack_type='null'. Attack runs install one window covering
+        # [start, end] for the targeted drones.
+        if args.attack == "none":
+            windows: list[AttackWindow] = []
+        else:
+            windows = [
+                AttackWindow(
+                    start_epoch=capture_start_epoch + args.start,
+                    end_epoch=capture_start_epoch + args.end,
+                    target_drones=frozenset(target_ids),
+                    attack_type=args.attack,
+                )
+            ]
         labels = LabelLookup(windows)
         drone_ids = list(range(1, args.size + 1))
         writer = PacketWriter(
@@ -563,35 +570,41 @@ def main() -> int:
                 except Exception as exc:
                     log.warning("Drone %d GCS stage error: %s", n, exc)
 
-        # Phase 8: sleep until attack start.
-        log.info("Waiting until attack window opens at +%.1fs…", args.start)
-        _sleep_until(capture_start_epoch + args.start)
+        if args.attack == "none":
+            # Benign-only: no spoofing threads, just capture for the mission
+            # duration so every row in every drone's CSV is labelled null.
+            log.info("Benign mode (--attack none); capturing for %.1fs with no spoofing.", args.end)
+            _sleep_until(capture_start_epoch + args.end)
+        else:
+            # Phase 8: sleep until attack start.
+            log.info("Waiting until attack window opens at +%.1fs…", args.start)
+            _sleep_until(capture_start_epoch + args.start)
 
-        # Phase 9-10: launch attack threads; wait until window closes; stop.
-        attack_duration = args.end - args.start
-        stop_event = threading.Event()
-        handler = ATTACK_HANDLERS[args.attack]
+            # Phase 9-10: launch attack threads; wait until window closes; stop.
+            attack_duration = args.end - args.start
+            stop_event = threading.Event()
+            handler = ATTACK_HANDLERS[args.attack]
 
-        attack_threads: list[threading.Thread] = []
-        for did in target_ids:
-            ip, port = companion_endpoint(did)
-            t = threading.Thread(
-                target=handler,
-                args=(ip, port, attack_duration, args.rate_hz, stop_event),
-                daemon=True,
-                name=f"attack-drone-{did}",
-            )
-            t.start()
-            attack_threads.append(t)
-            log.info("Attack thread started for drone %d (%s:%d).", did, ip, port)
+            attack_threads: list[threading.Thread] = []
+            for did in target_ids:
+                ip, port = companion_endpoint(did)
+                t = threading.Thread(
+                    target=handler,
+                    args=(ip, port, attack_duration, args.rate_hz, stop_event),
+                    daemon=True,
+                    name=f"attack-drone-{did}",
+                )
+                t.start()
+                attack_threads.append(t)
+                log.info("Attack thread started for drone %d (%s:%d).", did, ip, port)
 
-        log.info("Waiting until attack window closes at +%.1fs…", args.end)
-        _sleep_until(capture_start_epoch + args.end)
-        stop_event.set()
+            log.info("Waiting until attack window closes at +%.1fs…", args.end)
+            _sleep_until(capture_start_epoch + args.end)
+            stop_event.set()
 
-        for t in attack_threads:
-            t.join(timeout=5.0)
-        log.info("Attack complete.")
+            for t in attack_threads:
+                t.join(timeout=5.0)
+            log.info("Attack complete.")
 
     finally:
         # Phase 11: stop sniffer and close writer.
