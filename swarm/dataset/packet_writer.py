@@ -1,4 +1,10 @@
-"""CSV writer that streams every MAVLink event to a single ``log.csv``.
+"""CSV writer that streams every MAVLink event to **per-drone** log files.
+
+For each drone in the swarm the writer opens
+``<output_dir>/drone_<NNN>.csv`` (zero-padded to 3 digits) and routes each
+event to the file matching the listener's ``drone_id``. Since each
+listener thread writes to its own file there is no contention and no
+lock is needed.
 
 One row per MAVLink message, with columns being the **union** of all
 ardupilotmega message-type schemas plus MAV/IP/UDP/TCP headers,
@@ -10,8 +16,8 @@ training shapes — it just records what happened, when, and whether the
 ``LabelLookup`` flagged it. Sorting, filtering, windowing, and per-window
 label derivation all happen downstream in the training pipeline.
 
-Rows are written in **arrival order**. Training-time consumers sort by the
-``timestamp`` column (millisecond integer) before windowing.
+Rows are written in **arrival order** within each drone's file. Training
+sorts by the ``timestamp`` column (millisecond integer) before windowing.
 
 The column order is built deterministically from
 :data:`~swarm.dataset.mavlink_schema.SCHEMA`, so a live MAVLink consumer at
@@ -21,7 +27,6 @@ inference time can reuse the identical layout in-memory.
 from __future__ import annotations
 
 import io
-import threading
 from pathlib import Path
 from typing import Any
 
@@ -138,33 +143,41 @@ def _build_payload_union() -> list[str]:
 
 
 class PacketWriter:
-    """Streams every MAVLink event to a single ``log.csv`` file.
+    """Streams every MAVLink event to **per-drone** CSV files.
 
-    Thread-safe: a single :class:`threading.Lock` serialises the per-row
-    ``write`` call so that lines from multiple drone-listener threads do not
-    interleave.
+    Files are named ``drone_<NNN>.csv`` (zero-padded to 3 digits) under
+    *output_dir*. The set of drones is fixed at construction time, all
+    files are opened up-front with the union-schema header pre-written,
+    and ``handle()`` dispatches each row to the file matching
+    ``drone_id``. Because each listener thread writes only to its own
+    file there is no contention — no lock is required for writes.
 
     Attributes:
-        output_path: Destination path for the unified log CSV.
+        output_dir: Directory containing one ``drone_<NNN>.csv`` per drone.
         labels: Label resolver consulted for each row's ``attack_type``.
         sim_uuid: Run identifier inserted as the ``sim_uuid`` column.
-        counts: Mapping from MAVLink message-type name to rows written.
+        counts: Mapping from MAVLink message-type name to rows written
+            (across all drones; may race under concurrent updates but the
+            count is only used for the end-of-run stat log).
     """
 
     def __init__(
         self,
-        output_path: Path,
+        output_dir: Path,
         labels: LabelLookup,
         sim_uuid: str,
+        drone_ids: list[int],
     ) -> None:
-        """Open *output_path* and write the union-schema header row.
+        """Open one ``drone_<NNN>.csv`` per drone with the union-schema header.
 
         Args:
-            output_path: Destination CSV path (e.g. ``<run_dir>/log.csv``).
+            output_dir: Directory under which per-drone files are written.
             labels: :class:`~swarm.dataset.labels.LabelLookup` for row annotation.
             sim_uuid: Run identifier string inserted on every row.
+            drone_ids: Listener instance numbers (1-based). One file is
+                opened per ID; ``handle()`` calls for unknown IDs are dropped.
         """
-        self.output_path = output_path
+        self.output_dir = output_dir
         self.labels = labels
         self.sim_uuid = sim_uuid
         self.counts: dict[str, int] = {}
@@ -172,11 +185,15 @@ class PacketWriter:
         self._payload_fields = _build_payload_union()
         self._columns = self._build_columns()
         self._col_index: dict[str, int] = {c: i for i, c in enumerate(self._columns)}
-        self._lock = threading.Lock()
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh: io.TextIOWrapper = open(output_path, "w", buffering=1 << 20)
-        self._fh.write(",".join(self._columns) + "\n")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        header_line = ",".join(self._columns) + "\n"
+        self._files: dict[int, io.TextIOWrapper] = {}
+        for drone_id in drone_ids:
+            path = output_dir / f"drone_{drone_id:03d}.csv"
+            fh = open(path, "w", buffering=1 << 16)  # 64KB buffer per file
+            fh.write(header_line)
+            self._files[drone_id] = fh
 
     # ------------------------------------------------------------------
     # Public API
@@ -191,7 +208,7 @@ class PacketWriter:
         frame_epoch: float,
         drone_id: int | None,
     ) -> None:
-        """Write one MAVLink message as a row in the unified log.
+        """Write one MAVLink message to that drone's CSV file.
 
         Args:
             mav_msg: A pymavlink ``MAVLink_message`` instance.
@@ -200,8 +217,15 @@ class PacketWriter:
             udp_fields: Dict keyed by ``UDP_HEADER_FIELDS`` names, or ``None``.
             tcp_fields: Dict keyed by ``TCP_HEADER_FIELDS`` names, or ``None``.
             frame_epoch: UNIX timestamp of the captured frame.
-            drone_id: MAVLink system-id of the originating drone, or ``None``.
+            drone_id: Listener instance number identifying which file to
+                write to. Unknown IDs are dropped silently.
         """
+        if drone_id is None:
+            return
+        fh = self._files.get(drone_id)
+        if fh is None:
+            return
+
         idx = self._col_index
         cells: list[str] = ["null"] * len(self._columns)
 
@@ -234,19 +258,19 @@ class PacketWriter:
         cells[idx["frame_timestamp"]] = repr(frame_epoch)
         cells[idx["attack_type"]] = _format_cell(self.labels.lookup(frame_epoch, drone_id))
 
-        line = ",".join(cells) + "\n"
-        with self._lock:
-            self._fh.write(line)
-
+        # Single-writer-per-file: no lock needed.
+        fh.write(",".join(cells) + "\n")
         self.counts[type_name] = self.counts.get(type_name, 0) + 1
 
     def close(self) -> None:
-        """Flush and close the log file. Safe to call multiple times."""
-        if self._fh is not None and not self._fh.closed:
-            try:
-                self._fh.close()
-            except Exception:
-                pass
+        """Flush and close every per-drone file. Safe to call multiple times."""
+        for fh in self._files.values():
+            if fh is not None and not fh.closed:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+        self._files.clear()
 
     # ------------------------------------------------------------------
     # Private helpers

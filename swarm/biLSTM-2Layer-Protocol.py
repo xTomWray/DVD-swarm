@@ -274,90 +274,76 @@ def load_window_normalize_sim(sim_path, primary_csv, label,
     return (windows, label)
 
 
-def iter_log_sims(
+def load_window_normalize_log(
     log_path: str,
     primary_type: str,
     window_size: int,
     stride: int,
     core_cols: list[str],
     label_policy: str = "any",
-):
-    """Yield one (sysid, windows, labels) tuple per drone in log_path.
+) -> tuple[list[np.ndarray], list[int]] | None:
+    """Load one per-drone log file, slide windows, return per-window labels.
 
-    A unified log.csv from DVD-swarm contains MAVLink events from every drone
-    in the swarm interleaved by arrival order. Treating the whole file as one
-    time series Frankensteins drones together (window crosses drone
-    boundaries), so we groupby('sysid') and emit each drone as its own sim.
+    Each ``<run_dir>/csv/drone_<NNN>.csv`` produced by DVD-swarm contains
+    every MAVLink event flowing through one drone's mavlink-routerd. The
+    file is therefore physically one drone's perspective — no groupby
+    needed — and we just filter to primary_type, sort by timestamp, and
+    slide windows.
 
-    Per-window labels are derived from the attack_type column using
-    label_policy. The attack flag is captured BEFORE preprocess_df strips
-    non-numeric columns. Each drone's rows are sorted chronologically before
-    windowing so engineered features (diffs, autocorr, rolling stats) are
-    physically meaningful.
+    Per-window labels come from the attack_type column under label_policy.
+    The attack flag is captured before preprocess_df strips non-numeric
+    columns.
 
     Args:
-        log_path: Path to a unified log.csv produced by DVD-swarm.
-        primary_type: MAVLink message type to retain, e.g. "ATTITUDE".
+        log_path: Path to one drone's CSV (e.g. ``.../csv/drone_005.csv``).
+        primary_type: MAVLink message type to retain, e.g. ``"ATTITUDE"``.
         window_size: Number of timesteps per window.
         stride: Step between successive windows.
         core_cols: Feature columns used by engineer_features / preprocess_df.
         label_policy: How to label each window:
-            "any"      - 1 if any row in the window is an attack.
-            "majority" - 1 if more than half the rows are attacks.
-            "all"      - 1 if every row in the window is an attack.
+            ``"any"``      - 1 if any row in the window is an attack.
+            ``"majority"`` - 1 if more than half the rows are attacks.
+            ``"all"``      - 1 if every row in the window is an attack.
 
-    Yields:
-        (sysid, windows, labels) tuples — one per drone with enough rows
-        to produce at least one window. Drones with fewer than window_size
-        rows of primary_type are skipped silently.
+    Returns:
+        ``(windows, labels)`` lists, or ``None`` if the file has fewer than
+        ``window_size`` rows of ``primary_type``.
     """
     df = pd.read_csv(log_path)
     df = df[df["mav_packet_type"] == primary_type].copy()
-    if df.empty:
-        return
+    if len(df) < window_size:
+        return None
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # Coerce sysid once; rows where sysid is "null" or otherwise non-numeric
-    # are dropped (typically headerless BAD_DATA frames that slipped past
-    # the writer's labeller).
-    df["sysid"] = pd.to_numeric(df["sysid"], errors="coerce")
-    df = df.dropna(subset=["sysid"])
-    df["sysid"] = df["sysid"].astype(int)
+    # Capture attack flag BEFORE preprocess_df removes the string column.
+    attack_flag: np.ndarray = (df["attack_type"] != "null").astype(int).to_numpy()
 
     pseudo_csv = primary_type + ".csv"
+    df_processed = preprocess_df(df, core_cols, pseudo_csv)
+    features = normalize_simulation(df_processed.values)
+    if len(features) < window_size:
+        return None
 
-    for sysid, sub in df.groupby("sysid", sort=True):
-        sub = sub.sort_values("timestamp").reset_index(drop=True)
-        if len(sub) < window_size:
-            continue
+    windows: list[np.ndarray] = []
+    labels: list[int] = []
+    for i in range(0, len(features) - window_size + 1, stride):
+        window_flags = attack_flag[i : i + window_size]
+        if label_policy == "majority":
+            label = int(window_flags.mean() > 0.5)
+        elif label_policy == "all":
+            label = int(window_flags.all())
+        else:  # "any" (default)
+            label = int(window_flags.any())
+        windows.append(features[i : i + window_size])
+        labels.append(label)
 
-        # Capture attack flag BEFORE preprocess_df removes the string column.
-        attack_flag: np.ndarray = (sub["attack_type"] != "null").astype(int).to_numpy()
+    if not windows:
+        return None
 
-        sub_processed = preprocess_df(sub, core_cols, pseudo_csv)
-        features = normalize_simulation(sub_processed.values)
-        if len(features) < window_size:
-            continue
-
-        windows: list[np.ndarray] = []
-        labels: list[int] = []
-        for i in range(0, len(features) - window_size + 1, stride):
-            window_flags = attack_flag[i : i + window_size]
-            if label_policy == "majority":
-                label = int(window_flags.mean() > 0.5)
-            elif label_policy == "all":
-                label = int(window_flags.all())
-            else:  # "any" (default)
-                label = int(window_flags.any())
-            windows.append(features[i : i + window_size])
-            labels.append(label)
-
-        if not windows:
-            continue
-
-        n_attack = sum(labels)
-        print(f"  Loaded {len(windows):>5} windows ({n_attack} attack, "
-              f"{len(windows) - n_attack} benign) <- {log_path} sysid={int(sysid)}")
-        yield (int(sysid), windows, labels)
+    n_attack = sum(labels)
+    print(f"  Loaded {len(windows):>5} windows ({n_attack} attack, "
+          f"{len(windows) - n_attack} benign) <- {log_path}")
+    return (windows, labels)
 
 
 def balance_sims(sims):
@@ -416,22 +402,41 @@ if __name__ == "__main__":
     print(f"Label policy : {args.label_policy}")
     print(f"Core features: {core_cols}")
 
-    # ── Glob all unified log files ────────────────────────────────────────────
-    log_files = sorted(glob.glob(
-        os.path.join(args.data_dir, '**', 'log.csv'), recursive=True
+    # ── Glob all per-drone log files ──────────────────────────────────────────
+    drone_files = sorted(glob.glob(
+        os.path.join(args.data_dir, '**', 'csv', 'drone_*.csv'), recursive=True
     ))
-    if not log_files:
+    if not drone_files:
         raise FileNotFoundError(
-            f"No log.csv files found under '{args.data_dir}'. "
-            "Check --data-dir and that DVD-swarm has been run."
+            f"No csv/drone_*.csv files found under '{args.data_dir}'. "
+            "Check --data-dir and that DVD-swarm has been run with the "
+            "per-drone PacketWriter."
         )
-    print(f"Found {len(log_files)} sim log(s)")
 
-    # ── Per-sim 80/20 split — no window leakage across the boundary ──────────
-    train_logs, val_logs = train_test_split(
-        log_files, test_size=0.2, random_state=42
+    # Group files by their parent run directory so the train/val split is
+    # at the RUN level — drones from one run never span both folds.
+    runs: dict[str, list[str]] = {}
+    for f in drone_files:
+        # .../output/run_X/csv/drone_NNN.csv  ->  .../output/run_X
+        run_dir = os.path.dirname(os.path.dirname(f))
+        runs.setdefault(run_dir, []).append(f)
+
+    run_paths = sorted(runs.keys())
+    print(f"Found {len(drone_files)} drone file(s) across {len(run_paths)} run(s)")
+
+    # ── Per-run 80/20 split — run-level isolation ────────────────────────────
+    if len(run_paths) < 2:
+        raise RuntimeError(
+            f"Only {len(run_paths)} run found; need at least 2 for an 80/20 split. "
+            "Run more sims before training."
+        )
+    train_runs, val_runs = train_test_split(
+        run_paths, test_size=0.2, random_state=42
     )
-    print(f"Train sims: {len(train_logs)}  |  Val sims: {len(val_logs)}")
+    train_files = [f for r in train_runs for f in runs[r]]
+    val_files   = [f for r in val_runs   for f in runs[r]]
+    print(f"Train runs: {len(train_runs)} ({len(train_files)} drones)  |  "
+          f"Val runs: {len(val_runs)} ({len(val_files)} drones)")
 
     # ── Save Stage 1 config (used by live detector at inference time) ─────────
     # TODO: per-window Stage 1 flat-line filtering during inference
@@ -447,10 +452,7 @@ if __name__ == "__main__":
         pickle.dump(stage1_config, f)
     print(f"\n✓ Stage 1 config saved → stage1_{attack_id}.pkl")
 
-    # ── Load windows per (run, sysid) — each drone is its own sim ─────────────
-    # Run-level isolation (a full run is entirely in train OR val) is preserved
-    # by the earlier train_test_split over log_files; within each run, every
-    # drone contributes its own coherent time series.
+    # ── Load windows — one file = one drone = one sim ─────────────────────────
     all_train_windows: list[np.ndarray] = []
     all_train_labels:  list[int]        = []
     all_val_windows:   list[np.ndarray] = []
@@ -459,28 +461,34 @@ if __name__ == "__main__":
     n_val_sims   = 0
 
     print("\n── Loading train sims ────────────────────────────────────────────")
-    for log_path in train_logs:
-        for _sysid, ws, ls in iter_log_sims(
-            log_path, args.primary_type,
+    for f in train_files:
+        out = load_window_normalize_log(
+            f, args.primary_type,
             args.window_size, args.stride, core_cols,
             label_policy=args.label_policy,
-        ):
-            all_train_windows.extend(ws)
-            all_train_labels.extend(ls)
-            n_train_sims += 1
+        )
+        if out is None:
+            continue
+        ws, ls = out
+        all_train_windows.extend(ws)
+        all_train_labels.extend(ls)
+        n_train_sims += 1
 
     print("\n── Loading val sims ──────────────────────────────────────────────")
-    for log_path in val_logs:
-        for _sysid, ws, ls in iter_log_sims(
-            log_path, args.primary_type,
+    for f in val_files:
+        out = load_window_normalize_log(
+            f, args.primary_type,
             args.window_size, args.stride, core_cols,
             label_policy=args.label_policy,
-        ):
-            all_val_windows.extend(ws)
-            all_val_labels.extend(ls)
-            n_val_sims += 1
+        )
+        if out is None:
+            continue
+        ws, ls = out
+        all_val_windows.extend(ws)
+        all_val_labels.extend(ls)
+        n_val_sims += 1
 
-    print(f"\nTrain (run, drone) sims: {n_train_sims}  |  Val: {n_val_sims}")
+    print(f"\nTrain sims (drones): {n_train_sims}  |  Val sims (drones): {n_val_sims}")
 
     if not all_train_windows:
         raise RuntimeError("No training windows produced — check --data-dir and --primary-type.")

@@ -535,12 +535,14 @@ def main() -> int:
             )
         ]
         labels = LabelLookup(windows)
+        drone_ids = list(range(1, args.size + 1))
         writer = PacketWriter(
-            output_dir / "log.csv",
+            output_dir / "csv",
             labels,
             sim_uuid=output_dir.name,
+            drone_ids=drone_ids,
         )
-        sniffer = start_sniffer(list(range(1, args.size + 1)), writer)
+        sniffer = start_sniffer(drone_ids, writer)
         log.info("Capture started (epoch %.3f).", capture_start_epoch)
 
         # Phase 7: push all drones through GCS flight stages in parallel.
