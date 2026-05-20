@@ -1,24 +1,27 @@
-"""CSV writer for MAVLink packet captures compatible with dvdsh DUMP_CSV/JOIN_CSV.
+"""CSV writer that streams every MAVLink event to a single ``log.csv``.
 
-Each unique MAVLink message type is written to its own ``<TYPE>.csv`` file
-under *output_dir*.  Column ordering matches dvdsh exactly:
+One row per MAVLink message, with columns being the **union** of all
+ardupilotmega message-type schemas plus MAV/IP/UDP/TCP headers,
+``frame_timestamp``, and ``attack_type``. Cells absent for a given row's
+message type are written as ``"null"`` (dvdsh ``clean_arr_csv`` convention).
 
-    mav_packet_type, <MAV_HEADER_FIELDS>, <payload_fields>,
-    ip_<IP_HEADER_FIELDS>, udp_<UDP_HEADER_FIELDS>|tcp_<TCP_HEADER_FIELDS>,
-    frame_timestamp, attack_type
+The writer is intentionally agnostic of attack types, message types, and
+training shapes — it just records what happened, when, and whether the
+``LabelLookup`` flagged it. Sorting, filtering, windowing, and per-window
+label derivation all happen downstream in the training pipeline.
 
-Values are formatted with the dvdsh ``clean_arr_csv`` convention:
-- ``None``         → ``"null"``
-- ``list``/``tuple``/``bytes`` → ``";"``-joined elements
-- ``bool``         → ``"True"``/``"False"``
-- Everything else  → ``str(value)``
+Rows are written in **arrival order**. Training-time consumers sort by the
+``timestamp`` column (millisecond integer) before windowing.
 
-Commas inside cell values are replaced with ``";"`` (no quoting, dvdsh-compat).
+The column order is built deterministically from
+:data:`~swarm.dataset.mavlink_schema.SCHEMA`, so a live MAVLink consumer at
+inference time can reuse the identical layout in-memory.
 """
 
 from __future__ import annotations
 
 import io
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -29,22 +32,45 @@ from .dvdsh_compat import (
     UDP_HEADER_FIELDS,
 )
 from .labels import LabelLookup
+from .mavlink_schema import SCHEMA
 from .mavlink_schema import lookup as schema_lookup
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 # MAVLink v2 start-of-frame byte.
 _MAV2_MAGIC: int = 253
 
 
+# ---------------------------------------------------------------------------
+# Cell + header helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_cell(value: Any) -> str:
+    """Convert *value* to a CSV-safe cell using dvdsh ``clean_arr_csv`` rules.
+
+    Args:
+        value: Raw Python value from a MAVLink field or packet header.
+
+    Returns:
+        A string containing no unescaped commas or newlines.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    if isinstance(value, (list, tuple)):
+        return ";".join(_format_cell(v) for v in value)
+    if isinstance(value, bytes):
+        return ";".join(str(b) for b in value)
+    return str(value).replace(",", ";").replace("\n", " ")
+
+
 def _mav_header_value(mav_msg: Any, name: str) -> Any:
-    """Extract one MAV_HEADER_FIELDS value from *mav_msg*.
+    """Extract one MAV header field by dvdsh-format name.
 
     Args:
         mav_msg: A pymavlink ``MAVLink_message`` instance.
-        name: One of the dvdsh ``MAV_HEADER_FIELDS`` names.
+        name: One of the dvdsh ``MAV_HEADER_FIELDS`` names
+            (e.g. ``"payloadLength"``, ``"incompatibilityFlags"``).
 
     Returns:
         The header field value, or ``None`` when unavailable.
@@ -53,14 +79,14 @@ def _mav_header_value(mav_msg: Any, name: str) -> Any:
     match name:
         case "magic":
             return _MAV2_MAGIC
-        case "len":
+        case "payloadLength":
             if hdr is not None and hasattr(hdr, "mlen"):
                 return hdr.mlen
             buf = getattr(mav_msg, "_msgbuf", None)
             return len(buf) if buf is not None else None
-        case "incompat_flags":
+        case "incompatibilityFlags":
             return getattr(hdr, "incompat_flags", 0) if hdr is not None else 0
-        case "compat_flags":
+        case "compatibilityFlags":
             return getattr(hdr, "compat_flags", 0) if hdr is not None else 0
         case "seq":
             return getattr(hdr, "seq", None) if hdr is not None else None
@@ -79,86 +105,78 @@ def _mav_header_value(mav_msg: Any, name: str) -> Any:
             return None
 
 
-def _format_cell(value: Any) -> str:
-    """Convert *value* to a CSV-safe cell string using dvdsh conventions.
+def _build_payload_union() -> list[str]:
+    """Return the sorted union of payload field names, deduplicated against
+    fixed column names.
 
-    Args:
-        value: Raw Python value from a MAVLink field or packet header.
-
-    Returns:
-        A string with no unescaped commas or newlines.
-    """
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "True" if value else "False"
-    if isinstance(value, (list, tuple)):
-        return ";".join(_format_cell(v) for v in value)
-    if isinstance(value, bytes):
-        return ";".join(str(b) for b in value)
-    raw = str(value)
-    # Replace comma + newline to keep CSV parseable (dvdsh clean_arr_csv).
-    return raw.replace(",", ";").replace("\n", " ")
-
-
-# ---------------------------------------------------------------------------
-# Header memoisation
-# ---------------------------------------------------------------------------
-
-def _build_header(type_name: str, payload_fields: list[str]) -> str:
-    """Build the CSV header line for a given message type.
-
-    Args:
-        type_name: MAVLink message type name (e.g. ``"ATTITUDE"``).
-        payload_fields: Ordered list of payload field names for this type.
+    Some MAVLink payloads use field names that collide with MAV-header
+    columns (e.g. MISSION_ITEM has a ``seq`` field, but ``seq`` is also a MAV
+    header column). To keep the CSV header unique, payload fields whose name
+    is already reserved by a fixed column are excluded from the union.
 
     Returns:
-        The full header row string, including trailing newline.
+        Alphabetically sorted list of unique payload field names that do not
+        collide with any reserved column name.
     """
-    cols: list[str] = ["mav_packet_type"]
-    cols.extend(MAV_HEADER_FIELDS)
-    cols.extend(payload_fields)
-    cols.extend(f"ip_{f}" for f in IP_HEADER_FIELDS)
-    cols.extend(f"udp_{f}" for f in UDP_HEADER_FIELDS)
-    cols.extend(f"tcp_{f}" for f in TCP_HEADER_FIELDS)
-    cols.append("frame_timestamp")
-    cols.append("attack_type")
-    return ",".join(cols) + "\n"
+    reserved: set[str] = {
+        "mav_packet_type", "sim_uuid", "timestamp",
+        "frame_timestamp", "attack_type",
+        *MAV_HEADER_FIELDS,
+        *(f"ip_{f}" for f in IP_HEADER_FIELDS),
+        *(f"udp_{f}" for f in UDP_HEADER_FIELDS),
+        *(f"tcp_{f}" for f in TCP_HEADER_FIELDS),
+    }
+    names: set[str] = set()
+    for _msgid, (_msgname, fieldnames) in SCHEMA.items():
+        names.update(fieldnames)
+    return sorted(names - reserved)
 
 
 # ---------------------------------------------------------------------------
-# Public class
+# PacketWriter
 # ---------------------------------------------------------------------------
+
 
 class PacketWriter:
-    """Writes decoded MAVLink packets to per-type CSV files.
+    """Streams every MAVLink event to a single ``log.csv`` file.
 
-    One ``<TYPE>.csv`` file is created under *output_dir* for each unique
-    MAVLink message type seen during the capture.  File handles are cached
-    and buffered for performance; call :meth:`close` when capture ends.
+    Thread-safe: a single :class:`threading.Lock` serialises the per-row
+    ``write`` call so that lines from multiple drone-listener threads do not
+    interleave.
 
     Attributes:
-        output_dir: Directory where CSV files are written.
-        labels: Label resolver for annotating each row with ``attack_type``.
-        counts: Mapping from message-type name to rows written so far.
+        output_path: Destination path for the unified log CSV.
+        labels: Label resolver consulted for each row's ``attack_type``.
+        sim_uuid: Run identifier inserted as the ``sim_uuid`` column.
+        counts: Mapping from MAVLink message-type name to rows written.
     """
 
-    def __init__(self, output_dir: Path, labels: LabelLookup) -> None:
-        """Initialise the writer and create *output_dir* if necessary.
+    def __init__(
+        self,
+        output_path: Path,
+        labels: LabelLookup,
+        sim_uuid: str,
+    ) -> None:
+        """Open *output_path* and write the union-schema header row.
 
         Args:
-            output_dir: Directory for CSV output files.
+            output_path: Destination CSV path (e.g. ``<run_dir>/log.csv``).
             labels: :class:`~swarm.dataset.labels.LabelLookup` for row annotation.
+            sim_uuid: Run identifier string inserted on every row.
         """
-        self.output_dir = output_dir
+        self.output_path = output_path
         self.labels = labels
-        # type_name -> (file_handle, header_written)
-        self._files: dict[str, tuple[io.TextIOWrapper, bool]] = {}
+        self.sim_uuid = sim_uuid
         self.counts: dict[str, int] = {}
-        output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Memoised header strings keyed by type_name.
-        self._headers: dict[str, str] = {}
+        self._payload_fields = _build_payload_union()
+        self._columns = self._build_columns()
+        self._col_index: dict[str, int] = {c: i for i, c in enumerate(self._columns)}
+        self._lock = threading.Lock()
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh: io.TextIOWrapper = open(output_path, "w", buffering=1 << 20)
+        self._fh.write(",".join(self._columns) + "\n")
 
     # ------------------------------------------------------------------
     # Public API
@@ -173,142 +191,79 @@ class PacketWriter:
         frame_epoch: float,
         drone_id: int | None,
     ) -> None:
-        """Write one MAVLink message as a CSV row.
-
-        Creates a new file for the message type if this is the first time it
-        is seen, writing the header row first.
+        """Write one MAVLink message as a row in the unified log.
 
         Args:
             mav_msg: A pymavlink ``MAVLink_message`` instance.
-            ip_fields: Dict keyed by :data:`~swarm.dataset.dvdsh_compat.IP_HEADER_FIELDS`
-                names (without the ``ip_`` prefix).
-            udp_fields: Dict keyed by
-                :data:`~swarm.dataset.dvdsh_compat.UDP_HEADER_FIELDS` names, or
-                ``None`` for TCP packets.
-            tcp_fields: Dict keyed by
-                :data:`~swarm.dataset.dvdsh_compat.TCP_HEADER_FIELDS` names, or
-                ``None`` for UDP packets.
+            ip_fields: Dict keyed by unprefixed
+                :data:`~swarm.dataset.dvdsh_compat.IP_HEADER_FIELDS` names.
+            udp_fields: Dict keyed by ``UDP_HEADER_FIELDS`` names, or ``None``.
+            tcp_fields: Dict keyed by ``TCP_HEADER_FIELDS`` names, or ``None``.
             frame_epoch: UNIX timestamp of the captured frame.
             drone_id: MAVLink system-id of the originating drone, or ``None``.
         """
+        idx = self._col_index
+        cells: list[str] = ["null"] * len(self._columns)
+
         type_name: str = mav_msg.get_type()
-        msg_id: int = mav_msg.get_msgId()
+        cells[idx["mav_packet_type"]] = _format_cell(type_name)
+        cells[idx["sim_uuid"]] = self.sim_uuid
+        cells[idx["timestamp"]] = str(int(frame_epoch * 1000))
 
-        schema = schema_lookup(msg_id)
+        for name in MAV_HEADER_FIELDS:
+            cells[idx[name]] = _format_cell(_mav_header_value(mav_msg, name))
+
+        schema = schema_lookup(mav_msg.get_msgId())
         payload_fields: list[str] = schema[1] if schema is not None else []
+        for name in payload_fields:
+            col = idx.get(name)
+            if col is not None:
+                cells[col] = _format_cell(getattr(mav_msg, name, None))
 
-        fh, header_written = self._get_file(type_name, payload_fields)
+        for name in IP_HEADER_FIELDS:
+            cells[idx[f"ip_{name}"]] = _format_cell(ip_fields.get(name))
 
-        row = self._build_row(
-            mav_msg, type_name, payload_fields,
-            ip_fields, udp_fields, tcp_fields,
-            frame_epoch, drone_id,
-        )
-        fh.write(row)
+        if udp_fields is not None:
+            for name in UDP_HEADER_FIELDS:
+                cells[idx[f"udp_{name}"]] = _format_cell(udp_fields.get(name))
+
+        if tcp_fields is not None:
+            for name in TCP_HEADER_FIELDS:
+                cells[idx[f"tcp_{name}"]] = _format_cell(tcp_fields.get(name))
+
+        cells[idx["frame_timestamp"]] = repr(frame_epoch)
+        cells[idx["attack_type"]] = _format_cell(self.labels.lookup(frame_epoch, drone_id))
+
+        line = ",".join(cells) + "\n"
+        with self._lock:
+            self._fh.write(line)
 
         self.counts[type_name] = self.counts.get(type_name, 0) + 1
 
     def close(self) -> None:
-        """Flush and close all open CSV file handles.
-
-        Safe to call multiple times; subsequent calls are no-ops.
-        """
-        for fh, _ in self._files.values():
+        """Flush and close the log file. Safe to call multiple times."""
+        if self._fh is not None and not self._fh.closed:
             try:
-                fh.close()
+                self._fh.close()
             except Exception:
                 pass
-        self._files.clear()
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _get_file(
-        self, type_name: str, payload_fields: list[str]
-    ) -> tuple[io.TextIOWrapper, bool]:
-        """Return (file_handle, header_written) for *type_name*, creating if new.
-
-        Args:
-            type_name: MAVLink message type name.
-            payload_fields: Payload field names used to build the header if new.
+    def _build_columns(self) -> list[str]:
+        """Build the full ordered column list for ``log.csv``.
 
         Returns:
-            A tuple of the open file handle and whether the header was already
-            written (always ``True`` after this call returns).
+            List of column names in the fixed dvdsh-compatible order.
         """
-        if type_name in self._files:
-            return self._files[type_name]
-
-        path = self.output_dir / f"{type_name}.csv"
-        fh: io.TextIOWrapper = open(path, "a", buffering=1 << 20)  # noqa: WPS515
-
-        header = self._headers.get(type_name)
-        if header is None:
-            header = _build_header(type_name, payload_fields)
-            self._headers[type_name] = header
-
-        fh.write(header)
-        self._files[type_name] = (fh, True)
-        return fh, True
-
-    def _build_row(
-        self,
-        mav_msg: Any,
-        type_name: str,
-        payload_fields: list[str],
-        ip_fields: dict[str, Any],
-        udp_fields: dict[str, Any] | None,
-        tcp_fields: dict[str, Any] | None,
-        frame_epoch: float,
-        drone_id: int | None,
-    ) -> str:
-        """Assemble one CSV data row.
-
-        Args:
-            mav_msg: pymavlink message instance.
-            type_name: Message type string (e.g. ``"ATTITUDE"``).
-            payload_fields: Ordered payload field names.
-            ip_fields: IP header value dict (no prefix).
-            udp_fields: UDP header value dict, or ``None``.
-            tcp_fields: TCP header value dict, or ``None``.
-            frame_epoch: Frame UNIX timestamp.
-            drone_id: Originating drone system-id, or ``None``.
-
-        Returns:
-            A complete CSV row string, including trailing newline.
-        """
-        cells: list[str] = []
-
-        # mav_packet_type
-        cells.append(_format_cell(type_name))
-
-        # MAV header fields
-        for name in MAV_HEADER_FIELDS:
-            cells.append(_format_cell(_mav_header_value(mav_msg, name)))
-
-        # Payload fields
-        for name in payload_fields:
-            cells.append(_format_cell(getattr(mav_msg, name, None)))
-
-        # IP header fields
-        for name in IP_HEADER_FIELDS:
-            cells.append(_format_cell(ip_fields.get(name)))
-
-        # UDP header fields (null when packet is TCP)
-        for name in UDP_HEADER_FIELDS:
-            value = udp_fields.get(name) if udp_fields is not None else None
-            cells.append(_format_cell(value))
-
-        # TCP header fields (null when packet is UDP)
-        for name in TCP_HEADER_FIELDS:
-            value = tcp_fields.get(name) if tcp_fields is not None else None
-            cells.append(_format_cell(value))
-
-        # frame_timestamp — full float precision
-        cells.append(repr(frame_epoch))
-
-        # attack_type label
-        cells.append(_format_cell(self.labels.lookup(frame_epoch, drone_id)))
-
-        return ",".join(cells) + "\n"
+        cols: list[str] = ["mav_packet_type", "sim_uuid", "timestamp"]
+        cols.extend(MAV_HEADER_FIELDS)
+        cols.extend(self._payload_fields)
+        cols.extend(f"ip_{f}" for f in IP_HEADER_FIELDS)
+        cols.extend(f"udp_{f}" for f in UDP_HEADER_FIELDS)
+        cols.extend(f"tcp_{f}" for f in TCP_HEADER_FIELDS)
+        cols.append("frame_timestamp")
+        cols.append("attack_type")
+        return cols

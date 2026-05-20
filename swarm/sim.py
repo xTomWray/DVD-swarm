@@ -467,7 +467,6 @@ def main() -> int:
 
     output_dir = _resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "csv").mkdir(exist_ok=True)
 
     log.info("Output directory: %s", output_dir)
 
@@ -536,7 +535,11 @@ def main() -> int:
             )
         ]
         labels = LabelLookup(windows)
-        writer = PacketWriter(output_dir / "csv", labels)
+        writer = PacketWriter(
+            output_dir / "log.csv",
+            labels,
+            sim_uuid=output_dir.name,
+        )
         sniffer = start_sniffer(list(range(1, args.size + 1)), writer)
         log.info("Capture started (epoch %.3f).", capture_start_epoch)
 

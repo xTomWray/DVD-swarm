@@ -11,9 +11,9 @@ whenever dvdsh's field ordering or naming changes.
 
 MAV_HEADER_FIELDS: list[str] = [
     "magic",
-    "len",
-    "incompat_flags",
-    "compat_flags",
+    "payloadLength",
+    "incompatibilityFlags",
+    "compatibilityFlags",
     "seq",
     "sysid",
     "compid",
