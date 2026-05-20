@@ -20,6 +20,7 @@ import logging
 import math
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -197,31 +198,22 @@ def _run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]
 def _probe_one(n: int, timeout: float) -> bool:
     """Check whether drone instance *n*'s flight controller is ready.
 
-    Connects to the FC's MAVLink TCP endpoint and waits for the first
-    HEARTBEAT. This mirrors what ``arm-and-takeoff.py`` does, so success
-    here means the GCS stages will succeed too.
+    Opens a raw TCP connection to the FC's MAVLink port. A successful
+    connect means ArduPilot is listening; we don't need to wait for a
+    HEARTBEAT here (the GCS stages do that themselves).
 
     Args:
         n: Drone instance number (1-based).
-        timeout: Wait-for-heartbeat timeout in seconds.
+        timeout: Connection timeout in seconds.
 
     Returns:
-        ``True`` when a HEARTBEAT is received within *timeout*.
+        ``True`` when the TCP port accepts a connection.
     """
-    from pymavlink import mavutil
-
-    conn = None
     try:
-        conn = mavutil.mavlink_connection(f"tcp:10.13.{n}.2:5760")
-        return conn.wait_heartbeat(timeout=timeout) is not None
-    except Exception:
+        with socket.create_connection((f"10.13.{n}.2", 5760), timeout=timeout):
+            return True
+    except OSError:
         return False
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
 
 
 def _wait_for_swarm_ready(
@@ -381,7 +373,7 @@ def main() -> int:
         _wait_for_swarm_ready(
             args.size,
             per_instance_timeout=2.0,
-            total_timeout=30.0 * math.ceil(args.size / 10),
+            total_timeout=max(120.0, 30.0 * math.ceil(args.size / 10)),
         )
 
         # Phase 6: set up label windows and start sniffer.
