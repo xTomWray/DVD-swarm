@@ -257,6 +257,74 @@ def _probe_mavlink_tcp(n: int, timeout: float) -> bool:
         return False
 
 
+def _probe_simulator_mgmt(n: int, timeout: float) -> bool:
+    """Return True when the simulator-lite mgmt Flask is reachable."""
+    import requests
+
+    try:
+        resp = requests.get(f"http://localhost:{8000 + n}/", timeout=timeout)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+def _trigger_stage1(n: int) -> None:
+    """POST simulator-lite ``/stage1`` to boot SITL inside the FC container.
+
+    Without this, ``mavlink-routerd`` has nothing on the other end of its
+    ``/dev/ttyUSB0`` serial pipe — TCP 5760 accepts connections but never
+    delivers a HEARTBEAT, so ``arm-and-takeoff.py`` blocks on
+    ``wait_heartbeat()`` indefinitely.
+
+    Stage 1 also re-POSTs ``start-telemetry`` in a daemon thread; since our
+    router is already running, that thread silently 500s and is harmless.
+
+    Raises:
+        RuntimeError: When the POST does not return HTTP 200.
+    """
+    import requests
+
+    url = f"http://localhost:{8000 + n}/stage1"
+    try:
+        resp = requests.post(url, timeout=60)
+    except Exception as exc:
+        raise RuntimeError(f"drone {n}: POST {url} failed: {exc}") from exc
+
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"drone {n}: POST {url} returned {resp.status_code}: {resp.text[:200]}"
+        )
+    log.info("Stage 1 (SITL) triggered for drone %d.", n)
+
+
+def _probe_mavlink_heartbeat(n: int, timeout: float) -> bool:
+    """Return True when a HEARTBEAT arrives via TCP 5760 from inside GCS.
+
+    This confirms the full FC → router → GCS chain is live, which TCP-accept
+    alone does not. Uses the same library and connection string as
+    ``arm-and-takeoff.py`` so a pass here guarantees its ``wait_heartbeat``
+    will succeed.
+    """
+    script = (
+        "from pymavlink import mavutil; import sys; "
+        f"m = mavutil.mavlink_connection('tcp:10.13.{n}.3:5760'); "
+        f"hb = m.wait_heartbeat(timeout={timeout}); "
+        "sys.exit(0 if hb is not None else 1)"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "docker", "exec", f"ground-control-station-lite-{n}",
+                "python3", "-c", script,
+            ],
+            capture_output=True,
+            timeout=timeout + 5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def _poll_until_ready(
     probe: object,
     size: int,
@@ -301,22 +369,33 @@ def _poll_until_ready(
 def _wait_for_swarm_ready(size: int, per_instance_timeout: float, total_timeout: float) -> None:
     """Bring the swarm to a state where GCS stages can run.
 
-    Three sequential phases:
+    Sequential phases:
     1. Wait for companion Flask (``/socket-health`` → 200).
-    2. Trigger ``mavlink-routerd`` (POST ``/telemetry/start-telemetry``).
-    3. Wait for TCP 5760 on the companion to accept connections.
+    2. Wait for simulator-lite mgmt Flask (``/`` → 200).
+    3. Trigger ``mavlink-routerd`` (POST companion ``/telemetry/start-telemetry``).
+    4. Wait for TCP 5760 on the companion to accept connections.
+    5. Trigger Stage 1 (POST simulator-lite ``/stage1``) to boot SITL.
+    6. Wait for an actual HEARTBEAT to arrive over TCP 5760.
 
     Args:
         size: Number of drone instances.
-        per_instance_timeout: Per-probe timeout in seconds.
-        total_timeout: Budget for phase 1 and phase 3 each.
+        per_instance_timeout: Per-probe timeout in seconds (TCP / Flask probes).
+        total_timeout: Budget for each polled phase.
     """
     _poll_until_ready(_probe_flask, size, "companion Flask", per_instance_timeout, total_timeout)
+    _poll_until_ready(_probe_simulator_mgmt, size, "simulator mgmt Flask", per_instance_timeout, total_timeout)
 
     for n in range(1, size + 1):
         _start_mavlink_router(n)
 
     _poll_until_ready(_probe_mavlink_tcp, size, "MAVLink TCP 5760", per_instance_timeout, total_timeout)
+
+    for n in range(1, size + 1):
+        _trigger_stage1(n)
+
+    # SITL needs ~5–15s to start emitting heartbeats. Use a longer per-probe
+    # timeout here so each attempt actually has time to receive one.
+    _poll_until_ready(_probe_mavlink_heartbeat, size, "MAVLink HEARTBEAT", 10.0, total_timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -340,10 +419,20 @@ def _arm_and_autopilot(n: int, log_dir: Path) -> None:
 
     with open(log_path, "ab") as lf:
         for stage in ("arm-and-takeoff.py", "autopilot-flight.py"):
-            result = subprocess.run(
-                ["docker", "exec", container, "python3", f"/opt/gcs/stages/{stage}"],
-                capture_output=True,
-            )
+            try:
+                result = subprocess.run(
+                    ["docker", "exec", container, "python3", f"/opt/gcs/stages/{stage}"],
+                    capture_output=True,
+                    timeout=180,
+                )
+            except subprocess.TimeoutExpired as exc:
+                lf.write(f"=== {stage} TIMEOUT after 180s ===\n".encode())
+                if exc.stdout:
+                    lf.write(exc.stdout)
+                if exc.stderr:
+                    lf.write(exc.stderr)
+                log.warning("Drone %d %s timed out after 180s", n, stage)
+                continue
             lf.write(f"=== {stage} exit={result.returncode} ===\n".encode())
             lf.write(result.stdout)
             lf.write(result.stderr)
