@@ -269,6 +269,12 @@ def start_sniffer(
                         # Never let a write error kill the capture loop.
                         pass
 
-    sniffer = AsyncSniffer(iface=iface, filter=bpf_filter, prn=_prn, store=False)
+    # "any" is a Linux pseudo-interface not available on all kernels/scapy
+    # versions. Fall back to sniffing across all enumerated interfaces.
+    from scapy.all import get_if_list
+
+    effective_iface: str | list[str] = iface if iface != "any" else get_if_list()
+
+    sniffer = AsyncSniffer(iface=effective_iface, filter=bpf_filter, prn=_prn, store=False)
     sniffer.start()
     return sniffer
