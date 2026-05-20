@@ -83,7 +83,7 @@ def send_loop(
     # we call encode methods directly, but using mavudp directly is the
     # cleanest way to get a MAVLink framer with the right sysid/compid.
     mav = mavutil.mavlink_connection(
-        f"udpout:{target_ip}:{target_port}",
+        f"tcp:{target_ip}:{target_port}",
         source_system=1,
         source_component=1,
     )

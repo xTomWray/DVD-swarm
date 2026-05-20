@@ -29,7 +29,7 @@ from pathlib import Path
 
 import swarm.missions as missions
 from swarm.attacks.registry import ATTACK_HANDLERS
-from swarm.attacks.targets import gcs_endpoint, parse_targets
+from swarm.attacks.targets import companion_endpoint, parse_targets
 from swarm.dataset.labels import AttackWindow, LabelLookup
 from swarm.dataset.packet_writer import PacketWriter
 from swarm.dataset.sniffer import start_sniffer
@@ -568,7 +568,7 @@ def main() -> int:
 
         attack_threads: list[threading.Thread] = []
         for did in target_ids:
-            ip, port = gcs_endpoint(did)
+            ip, port = companion_endpoint(did)
             t = threading.Thread(
                 target=handler,
                 args=(ip, port, attack_duration, args.rate_hz, stop_event),

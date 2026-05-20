@@ -15,6 +15,23 @@ def gcs_endpoint(drone_id: int) -> tuple[str, int]:
     return (f"10.13.{drone_id}.4", 14550)
 
 
+def companion_endpoint(drone_id: int) -> tuple[str, int]:
+    """Companion-computer TCP MAVLink endpoint for the given drone instance.
+
+    Attack traffic sent here flows through mavlink-routerd, which routes it
+    to the SITL serial link, the GCS UDP endpoint, and all TCP clients
+    (including the dataset sniffer). This ensures spoofed packets appear in
+    the captured dataset with their actual field values.
+
+    Args:
+        drone_id: Numeric drone identifier (positive integer).
+
+    Returns:
+        A (host, port) tuple for the drone's companion TCP MAVLink endpoint.
+    """
+    return (f"10.13.{drone_id}.3", 5760)
+
+
 def parse_targets(spec: str) -> list[int]:
     """Parse a comma-separated drone list with optional ranges.
 
