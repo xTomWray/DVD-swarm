@@ -480,6 +480,7 @@ def main() -> int:
         duration_s=int(args.end),
         out_path=mission_host_path,
         seed=args.seed,
+        cruise_speed_m_s=3.0,  # conservative: generates ~67% more waypoints than needed
     )
     # Snapshot mission into output dir.
     (output_dir / "mission.txt").write_bytes(mission_host_path.read_bytes())
