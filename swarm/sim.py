@@ -499,6 +499,7 @@ def main() -> int:
     ])
     _run([
         "docker", "compose",
+        "--progress", "plain",
         "-p", "dvd-swarm",
         "-f", "docker-compose.swarm.yml",
         "up", "-d",
@@ -632,6 +633,7 @@ def main() -> int:
             try:
                 _run([
                     "docker", "compose",
+                    "--progress", "plain",
                     "-p", "dvd-swarm",
                     "-f", "docker-compose.swarm.yml",
                     "down", "-v", "--remove-orphans",

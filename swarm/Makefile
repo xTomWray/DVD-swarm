@@ -12,7 +12,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -41,6 +41,13 @@ help:
 	@echo ""
 	@echo "  make sim-benign N=50 END=300 RUNS=5"
 	@echo "      Run RUNS benign-only captures (no attack, label=null on every row)."
+	@echo ""
+	@echo "  make follow"
+	@echo "      tail -f the most-recent logs/*.log file."
+	@echo ""
+	@echo "Detached usage (so your terminal stays free):"
+	@echo "  nohup make sim-benign N=50 END=300 RUNS=5 > /dev/null 2>&1 &"
+	@echo "  make follow                  # watch the log in this or another terminal"
 	@echo ""
 	@echo "Memory per instance: ~1.5 GB with GCS (default) | ~1 GB no GCS"
 	@echo "Recommended for 16 GB host: 9 instances (with GCS)  |  14 instances (no GCS)"
@@ -203,6 +210,17 @@ sim-random:
 	        --attack $(ATTACK) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"
+
+# Tail the most-recent log file under <project_root>/logs/. Handy when
+# you've launched a sim with `nohup make sim-X ... > /dev/null 2>&1 &` and
+# want to monitor progress without occupying the shell that launched it.
+follow:
+	@cd .. && LATEST=$$(ls -t logs/*.log 2>/dev/null | head -1); \
+	if [ -z "$$LATEST" ]; then \
+	    echo "no logs in logs/. Run 'make sim*' first."; exit 1; \
+	fi; \
+	echo "==> tail -f $$LATEST   (Ctrl+C to stop)"; \
+	tail -f "$$LATEST"
 
 # Run RUNS benign-only captures. Every row in every drone's CSV gets
 # attack_type=null — useful for building a clean baseline before mixing
