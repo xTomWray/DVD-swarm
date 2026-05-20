@@ -220,24 +220,98 @@ def _packet_fingerprint(pkt: Any, IP: Any, UDP: Any, TCP: Any) -> tuple[Any, ...
     return (ip.src, ip.dst, ip.id, ip.proto)
 
 
-class _SnifferHandle:
-    """Lightweight handle returned by :func:`start_sniffer`.
+def _process_packet(pkt: Any, writer: PacketWriter, IP: Any, UDP: Any, TCP: Any) -> None:
+    """Feed one captured frame's payload through MAVLink parsing into *writer*.
 
-    Mirrors the subset of scapy ``AsyncSniffer`` we use elsewhere: a
-    ``stop()`` method that terminates the underlying tcpdump subprocess
-    and joins the reader thread.
+    Args:
+        pkt: Scapy packet object.
+        writer: :class:`PacketWriter` to receive decoded messages.
+        IP: scapy IP layer class.
+        UDP: scapy UDP layer class.
+        TCP: scapy TCP layer class.
+    """
+    if IP not in pkt:
+        return
+
+    ip = pkt[IP]
+    ip_hdr = _ip_fields(ip)
+    frame_epoch: float = float(pkt.time)
+
+    src_ip: str = ip.src
+    dst_ip: str = ip.dst
+    drone_id = _extract_drone_id(src_ip, dst_ip)
+
+    if UDP in pkt:
+        udp = pkt[UDP]
+        udp_hdr = _udp_fields(udp)
+        tcp_hdr = None
+        payload_bytes = bytes(udp.payload)
+        src_port: int = udp.sport
+    elif TCP in pkt:
+        tcp = pkt[TCP]
+        udp_hdr = None
+        tcp_hdr = _tcp_fields(tcp)
+        payload_bytes = bytes(tcp.payload)
+        src_port = tcp.sport
+    else:
+        return
+
+    if not payload_bytes:
+        return
+
+    parser = _get_parser(src_ip, src_port)
+
+    for byte in payload_bytes:
+        result = parser.parse_char(bytes([byte]))
+        if result is None:
+            continue
+        msgs = result if isinstance(result, list) else [result]
+        for msg in msgs:
+            if msg is None:
+                continue
+            try:
+                writer.handle(
+                    mav_msg=msg,
+                    ip_fields=ip_hdr,
+                    udp_fields=udp_hdr,
+                    tcp_fields=tcp_hdr,
+                    frame_epoch=frame_epoch,
+                    drone_id=drone_id,
+                )
+            except Exception:
+                pass
+
+
+class _SnifferHandle:
+    """Handle returned by :func:`start_sniffer`.
+
+    The capture runs as a tcpdump subprocess writing pcap directly to
+    disk. ``stop()`` terminates tcpdump and then replays the saved file
+    through the MAVLink parser. Parsing offline avoids the live-pipe
+    starvation we hit when reading ``tcpdump -w -`` while the
+    orchestrator was busy executing GCS stages.
     """
 
-    def __init__(self, proc: subprocess.Popen[bytes], thread: threading.Thread) -> None:
+    def __init__(
+        self,
+        proc: subprocess.Popen[bytes],
+        pcap_path: Any,
+        writer: PacketWriter,
+    ) -> None:
         self._proc = proc
-        self._thread = thread
+        self._pcap_path = pcap_path
+        self._writer = writer
         self._stopped = False
 
     def stop(self) -> None:
-        """Terminate tcpdump and wait briefly for the reader thread."""
+        """Stop capture, then parse the saved pcap into the writer.
+
+        Safe to call multiple times; subsequent calls are no-ops.
+        """
         if self._stopped:
             return
         self._stopped = True
+
         try:
             self._proc.terminate()
             try:
@@ -247,134 +321,111 @@ class _SnifferHandle:
                 self._proc.wait(timeout=2)
         except Exception as exc:
             log.warning("tcpdump terminate failed: %s", exc)
-        self._thread.join(timeout=5)
+
+        if self._proc.stderr is not None:
+            err = self._proc.stderr.read().decode(errors="replace").strip()
+            if err:
+                log.info("tcpdump stderr: %s", err)
+
+        self._replay()
+
+    def _replay(self) -> None:
+        """Read the saved pcap file and feed every packet to the writer."""
+        from scapy.layers.inet import IP, TCP, UDP
+        from scapy.utils import PcapReader
+
+        if not self._pcap_path.exists():
+            log.warning("Capture file %s missing; nothing to replay.", self._pcap_path)
+            return
+
+        total = 0
+        deduped = 0
+        seen: collections.OrderedDict[tuple[Any, ...], None] = collections.OrderedDict()
+        seen_cap = 65536
+
+        with PcapReader(str(self._pcap_path)) as pcap:
+            for pkt in pcap:
+                total += 1
+                fp = _packet_fingerprint(pkt, IP, UDP, TCP)
+                if fp is not None:
+                    if fp in seen:
+                        deduped += 1
+                        continue
+                    seen[fp] = None
+                    if len(seen) > seen_cap:
+                        seen.popitem(last=False)
+                _process_packet(pkt, self._writer, IP, UDP, TCP)
+
+        log.info(
+            "Replay complete: %d frames in pcap, %d duplicates skipped (%s)",
+            total,
+            deduped,
+            self._pcap_path,
+        )
 
 
 def start_sniffer(
     iface: str,
     ports: list[int],
     writer: PacketWriter,
+    pcap_path: Any,
 ) -> _SnifferHandle:
-    """Start a tcpdump-backed packet sniffer and return a stoppable handle.
+    """Start tcpdump capturing to *pcap_path*; replay on stop.
 
-    Captures UDP and TCP traffic on *ports* from *iface*, decodes embedded
-    MAVLink frames, and calls ``writer.handle`` for each complete message.
-    Duplicate frames (same packet seen on multiple interfaces under ``-i
-    any``) are dropped via a recent-fingerprint set.
+    The tcpdump process writes pcap to a file rather than to a pipe, so
+    the parent process cannot starve the capture by failing to drain a
+    pipe. Packet decoding happens offline in :meth:`_SnifferHandle.stop`
+    after the capture window closes — labels are timestamp-based so this
+    delay does not affect the final CSV contents. The raw pcap is left in
+    place as a debug artifact.
 
     Args:
-        iface: Interface name to sniff. ``"any"`` is preferred on Linux —
-            tcpdump handles it natively, unlike scapy's ``AsyncSniffer``.
-        ports: List of UDP/TCP port numbers to capture.
-        writer: :class:`~swarm.dataset.packet_writer.PacketWriter` instance
-            that receives each decoded MAVLink message.
+        iface: Interface name to sniff. ``"any"`` is preferred on Linux.
+        ports: UDP/TCP port numbers to capture.
+        writer: :class:`PacketWriter` instance that receives decoded
+            MAVLink messages during the replay phase.
+        pcap_path: Filesystem path the pcap will be written to.
 
     Returns:
         A :class:`_SnifferHandle` exposing ``.stop()``.
 
     Raises:
-        RuntimeError: When ``tcpdump`` is not on PATH or fails to start.
+        RuntimeError: When tcpdump is missing or exits immediately.
     """
-    # Local imports keep scapy initialisation off the module-load path.
-    from scapy.layers.inet import IP, TCP, UDP
-    from scapy.utils import PcapReader
-
     if shutil.which("tcpdump") is None:
         raise RuntimeError("tcpdump not found on PATH — install it (apt-get install tcpdump)")
 
     bpf_parts = [f"udp port {p} or tcp port {p}" for p in ports]
     bpf_filter = " or ".join(bpf_parts)
 
-    # -U flushes per packet (no kernel/userspace batching), -n disables DNS,
-    # -s 0 captures full payloads, -w - writes pcap to stdout.
-    cmd = ["tcpdump", "-i", iface, "-U", "-n", "-s", "0", "-w", "-", bpf_filter]
+    pcap_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "tcpdump",
+        "-i", iface,
+        "-U",            # packet-buffered writes
+        "-n",            # no DNS
+        "-s", "0",       # full snaplen
+        "-w", str(pcap_path),
+        bpf_filter,
+    ]
     log.info("Starting capture: %s", " ".join(cmd))
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
-        bufsize=0,
     )
-    if proc.stdout is None:
-        raise RuntimeError("tcpdump failed to provide stdout pipe")
 
-    # Bounded recent-fingerprint set. ~5s of moderate MAVLink traffic fits
-    # comfortably in 8192 entries; oldest get evicted FIFO.
-    seen: collections.OrderedDict[tuple[Any, ...], None] = collections.OrderedDict()
-    seen_cap = 8192
+    # Brief pause to catch an immediate crash (bad iface, perms, BPF syntax).
+    import time as _time
+    _time.sleep(0.5)
+    if proc.poll() is not None:
+        err = b""
+        if proc.stderr is not None:
+            err = proc.stderr.read()
+        raise RuntimeError(
+            f"tcpdump exited immediately (code {proc.returncode}): "
+            f"{err.decode(errors='replace').strip()}"
+        )
 
-    def _handle_one(pkt: Any) -> None:
-        if IP not in pkt:
-            return
-
-        fp = _packet_fingerprint(pkt, IP, UDP, TCP)
-        if fp is not None:
-            if fp in seen:
-                return
-            seen[fp] = None
-            if len(seen) > seen_cap:
-                seen.popitem(last=False)
-
-        ip = pkt[IP]
-        ip_hdr = _ip_fields(ip)
-        frame_epoch: float = float(pkt.time)
-
-        src_ip: str = ip.src
-        dst_ip: str = ip.dst
-        drone_id = _extract_drone_id(src_ip, dst_ip)
-
-        if UDP in pkt:
-            udp = pkt[UDP]
-            udp_hdr = _udp_fields(udp)
-            tcp_hdr = None
-            payload_bytes = bytes(udp.payload)
-            src_port: int = udp.sport
-        elif TCP in pkt:
-            tcp = pkt[TCP]
-            udp_hdr = None
-            tcp_hdr = _tcp_fields(tcp)
-            payload_bytes = bytes(tcp.payload)
-            src_port = tcp.sport
-        else:
-            return
-
-        if not payload_bytes:
-            return
-
-        parser = _get_parser(src_ip, src_port)
-
-        with _parser_lock:
-            for byte in payload_bytes:
-                result = parser.parse_char(bytes([byte]))
-                if result is None:
-                    continue
-                msgs = result if isinstance(result, list) else [result]
-                for msg in msgs:
-                    if msg is None:
-                        continue
-                    try:
-                        writer.handle(
-                            mav_msg=msg,
-                            ip_fields=ip_hdr,
-                            udp_fields=udp_hdr,
-                            tcp_fields=tcp_hdr,
-                            frame_epoch=frame_epoch,
-                            drone_id=drone_id,
-                        )
-                    except Exception:
-                        # Never let a write error kill the capture loop.
-                        pass
-
-    def _reader_loop() -> None:
-        try:
-            with PcapReader(proc.stdout) as pcap:  # type: ignore[arg-type]
-                for pkt in pcap:
-                    _handle_one(pkt)
-        except Exception as exc:
-            # Expected on stop() — proc.terminate closes the pipe.
-            log.debug("pcap reader exited: %s", exc)
-
-    thread = threading.Thread(target=_reader_loop, daemon=True, name="sniffer-pcap-reader")
-    thread.start()
-
-    return _SnifferHandle(proc, thread)
+    return _SnifferHandle(proc, pcap_path, writer)

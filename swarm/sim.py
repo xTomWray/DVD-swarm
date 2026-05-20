@@ -549,7 +549,12 @@ def main() -> int:
         ]
         labels = LabelLookup(windows)
         writer = PacketWriter(output_dir / "csv", labels)
-        sniffer = start_sniffer(args.iface, [14540, 14550, 5760], writer)
+        sniffer = start_sniffer(
+            args.iface,
+            [14540, 14550, 5760],
+            writer,
+            pcap_path=output_dir / "capture.pcap",
+        )
         log.info("Capture started (epoch %.3f).", capture_start_epoch)
 
         # Phase 7: push all drones through GCS flight stages in parallel.
