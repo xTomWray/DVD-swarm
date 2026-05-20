@@ -195,25 +195,31 @@ def _run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]
 
 
 def _probe_one(n: int, timeout: float) -> bool:
-    """Check whether drone instance *n*'s companion computer is up.
+    """Check whether drone instance *n*'s MAVLink router is accepting connections.
 
-    Hits the companion's ``/socket-health`` liveness endpoint. A 200 response
-    means the companion Flask app is running and the container's networking is
-    healthy. The GCS stages handle their own MAVLink wait internally, so this
-    is the right gate: confirm the container is reachable before handing off.
+    Runs a TCP connect check to port 5760 on the companion computer from
+    *inside* the GCS container — the same network path that ``arm-and-takeoff.py``
+    uses. A successful connect means ``mavlink-routerd`` is up and the GCS
+    stages will not hit ``ConnectionRefused``.
 
     Args:
         n: Drone instance number (1-based).
-        timeout: HTTP request timeout in seconds.
+        timeout: Per-command timeout in seconds.
 
     Returns:
-        ``True`` when the companion returns HTTP 200.
+        ``True`` when the connection succeeds.
     """
-    import requests
-
     try:
-        resp = requests.get(f"http://localhost:{3000 + n}/socket-health", timeout=timeout)
-        return resp.status_code == 200
+        result = subprocess.run(
+            [
+                "docker", "exec", f"ground-control-station-lite-{n}",
+                "python3", "-c",
+                f"import socket; socket.create_connection(('10.13.{n}.3', 5760), {timeout}).close()",
+            ],
+            capture_output=True,
+            timeout=timeout + 2,
+        )
+        return result.returncode == 0
     except Exception:
         return False
 
