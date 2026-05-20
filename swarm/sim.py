@@ -195,26 +195,25 @@ def _run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]
 
 
 def _probe_one(n: int, timeout: float) -> bool:
-    """Check whether drone instance *n* has live MAVLink telemetry.
+    """Check whether drone instance *n*'s companion computer is up.
 
-    Queries the companion computer's ``/telemetry/telemetry-status`` endpoint.
-    ``isTelemetryRunning: true`` means the companion has an active MAVLink
-    connection to the flight controller — the strongest available readiness
-    signal short of arming.
+    Hits the companion's ``/socket-health`` liveness endpoint. A 200 response
+    means the companion Flask app is running and the container's networking is
+    healthy. The GCS stages handle their own MAVLink wait internally, so this
+    is the right gate: confirm the container is reachable before handing off.
 
     Args:
         n: Drone instance number (1-based).
         timeout: HTTP request timeout in seconds.
 
     Returns:
-        ``True`` when telemetry is confirmed running.
+        ``True`` when the companion returns HTTP 200.
     """
     import requests
 
     try:
-        url = f"http://localhost:{3000 + n}/telemetry/telemetry-status"
-        resp = requests.get(url, timeout=timeout)
-        return bool(resp.json().get("isTelemetryRunning", False))
+        resp = requests.get(f"http://localhost:{3000 + n}/socket-health", timeout=timeout)
+        return resp.status_code == 200
     except Exception:
         return False
 
