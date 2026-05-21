@@ -111,18 +111,18 @@ def _parse_args() -> argparse.Namespace:
     run_p.add_argument(
         "--mission-request-timeout",
         type=float,
-        default=30.0,
+        default=60.0,
         help="Per-MISSION_REQUEST timeout (seconds) during mission upload. "
              "The legacy autopilot-flight.py hard-coded 5s, which dropped "
-             "uploads at N≥10 under CPU caps. 30s is safe at N=50 (default: 30).",
+             "uploads at N≥10 under CPU caps. 60s is safe at N=50 (default: 60).",
     )
     run_p.add_argument(
         "--mission-upload-retries",
         type=int,
-        default=2,
+        default=3,
         help="Number of times to re-attempt a full mission upload if a "
              "MISSION_REQUEST or MISSION_ACK times out. Each retry clears the "
-             "FC's partial mission first (default: 2 retries = up to 3 attempts).",
+             "FC's partial mission first (default: 3 retries = up to 4 attempts).",
     )
     run_p.add_argument(
         "--stage1-concurrency",

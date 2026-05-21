@@ -64,19 +64,19 @@ class StageConfig:
     instance: int
     waypoint_file: Path
     takeoff_alt_m: float = 10.0
-    mission_request_timeout: float = 30.0
-    mission_upload_retries: int = 2
-    arm_timeout: float = 30.0
-    gps_timeout: float = 60.0
-    # EKF takes longer to assert POS_HORIZ_ABS at N≥10 cold-boot than 30s —
-    # 9/10 drones hit the 30s wait in observed runs while one lucky drone
-    # got there in ~40s. The legacy arm-and-takeoff.py had NO ekf timeout
-    # (while True) which is how it always succeeded.
-    ekf_timeout: float = 120.0
-    # The "wait for COPTER_MODE_GUIDED confirmation HEARTBEAT" loop in the
-    # legacy script could spin briefly; 30s is plenty.
-    mode_set_timeout: float = 30.0
-    connect_timeout: float = 30.0
+    # All timeouts below are deliberately generous. The orchestrator's
+    # outer budget (a single sim run is 3-20 minutes) is the real bound;
+    # per-stage timeouts only exist to bail on genuinely-stuck drones so
+    # one bad drone doesn't hang the whole pool indefinitely. The legacy
+    # arm-and-takeoff.py had effectively no per-stage timeout at all and
+    # always worked, so erring large here just matches that behaviour.
+    mission_request_timeout: float = 60.0
+    mission_upload_retries: int = 3
+    arm_timeout: float = 60.0
+    gps_timeout: float = 120.0
+    ekf_timeout: float = 240.0
+    mode_set_timeout: float = 60.0
+    connect_timeout: float = 60.0
 
 
 class Stages:
