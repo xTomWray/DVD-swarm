@@ -42,12 +42,17 @@ help:
 	@echo "  make sim-benign N=50 END=300 RUNS=5"
 	@echo "      Run RUNS benign-only captures (no attack, label=null on every row)."
 	@echo ""
+	@echo "  Tuning knobs (any sim* target):"
+	@echo "    GCS_CONCURRENCY=8     (default 12) — lower if autopilot-flight exits 1 at high N"
+	@echo "    GCS_STAGE_TIMEOUT=300 (default 300) — bump for slower hosts"
+	@echo ""
 	@echo "  make follow"
 	@echo "      tail -f the most-recent logs/*.log file."
 	@echo ""
 	@echo "  make archive [NAME=label]"
 	@echo "      tar+gzip all output/run_* (and matching logs/) into"
 	@echo "      archives/<UTC>[_<NAME>].tar.gz, then delete the originals."
+	@echo "    KEEP_RAW=0            strip per-run raw/ dirs before archiving (smaller archive)"
 	@echo ""
 	@echo "  make restore ARCHIVE=archives/<file>.tar.gz"
 	@echo "      Extract a past archive back into output/ for re-training."
@@ -135,10 +140,12 @@ $(COMPOSE_FILE):
 
 # ── Full attack-cycle simulation ──────────────────────────────────────────────
 
-SIZE   ?= $(N)
-START  ?= 10
-END    ?= 1200
-ATTACK ?= attitude-spoof
+SIZE              ?= $(N)
+START             ?= 10
+END               ?= 1200
+ATTACK            ?= attitude-spoof
+GCS_CONCURRENCY   ?= 12
+GCS_STAGE_TIMEOUT ?= 300
 
 # Every sim* recipe tees its output to a UTC-timestamped file under
 # <project_root>/logs/ via this snippet:
@@ -156,7 +163,8 @@ sim:
 	set -o pipefail; \
 	$(PYTHON) -u -m swarm.sim run \
 	    --size $(SIZE) --start $(START) --end $(END) \
-	    --attack $(ATTACK) 2>&1 | tee "$$LOG"
+	    --attack $(ATTACK) \
+	    --gcs-concurrency $(GCS_CONCURRENCY) --gcs-stage-timeout $(GCS_STAGE_TIMEOUT) 2>&1 | tee "$$LOG"
 
 # ── Multi-run loops ───────────────────────────────────────────────────────────
 # Knobs:
@@ -192,7 +200,8 @@ sim-multi:
 	    echo "=== run $$i/$(RUNS)  N=$(SIZE) START=$(START) END=$(END) ATTACK=$(ATTACK) ==="; \
 	    $(PYTHON) -u -m swarm.sim run \
 	        --size $(SIZE) --start $(START) --end $(END) \
-	        --attack $(ATTACK) || exit 1; \
+	        --attack $(ATTACK) \
+	        --gcs-concurrency $(GCS_CONCURRENCY) --gcs-stage-timeout $(GCS_STAGE_TIMEOUT) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"
 
@@ -217,7 +226,8 @@ sim-random:
 	    echo "=== run $$i/$(RUNS)  N=$(SIZE) START=$$S END=$$E ATTACK=$(ATTACK) ==="; \
 	    $(PYTHON) -u -m swarm.sim run \
 	        --size $(SIZE) --start $$S --end $$E \
-	        --attack $(ATTACK) || exit 1; \
+	        --attack $(ATTACK) \
+	        --gcs-concurrency $(GCS_CONCURRENCY) --gcs-stage-timeout $(GCS_STAGE_TIMEOUT) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"
 
@@ -235,7 +245,8 @@ sim-random:
 # Tar+gzip every output/run_* (plus matching logs/sim-*.log) into
 # archives/<UTC>[_<NAME>].tar.gz then remove the originals.
 # Set NAME=<label> to add a human-readable suffix to the archive filename.
-NAME ?=
+NAME     ?=
+KEEP_RAW ?= 1
 archive:
 	@cd .. && \
 	if [ -z "$$(ls -d output/run_* 2>/dev/null)" ]; then \
@@ -248,9 +259,16 @@ archive:
 	if [ -n "$(NAME)" ]; then NAME_SUFFIX="_$(NAME)"; fi; \
 	ARCHIVE="archives/$${STAMP}$${NAME_SUFFIX}.tar.gz"; \
 	N=$$(ls -d output/run_* | wc -l); \
-	echo "[make] archiving $$N run dir(s) -> $$ARCHIVE"; \
+	TOTAL_KB=$$(du -ks output/run_* 2>/dev/null | awk '{s+=$$1} END {print s+0}'); \
+	EXCLUDE=""; \
+	if [ "$(KEEP_RAW)" = "0" ]; then EXCLUDE="--exclude=output/run_*/raw"; fi; \
+	echo "[make] archiving $$N run dir(s) (~$$((TOTAL_KB/1024)) MB raw, KEEP_RAW=$(KEEP_RAW)) -> $$ARCHIVE"; \
 	set -o pipefail; \
-	tar -czf "$$ARCHIVE" output/run_* $$(ls logs/sim-*.log logs/sim_*.log 2>/dev/null) 2>&1 | tail -5 ; \
+	tar $$EXCLUDE \
+	    --checkpoint=2000 \
+	    --checkpoint-action=ttyout='  %T{%H:%M:%S} %{r}T processed (%s archived)\n' \
+	    -czf "$$ARCHIVE" \
+	    output/run_* $$(ls logs/sim-*.log logs/sim_*.log 2>/dev/null); \
 	echo "[make] removing originals"; \
 	rm -rf output/run_*; \
 	echo "[make] done. $$ARCHIVE ($$(du -h "$$ARCHIVE" | cut -f1))"
@@ -308,6 +326,7 @@ sim-benign:
 	    echo "=== benign run $$i/$(RUNS)  N=$(SIZE) END=$(END) ==="; \
 	    $(PYTHON) -u -m swarm.sim run \
 	        --size $(SIZE) --start 0 --end $(END) \
-	        --attack none || exit 1; \
+	        --attack none \
+	        --gcs-concurrency $(GCS_CONCURRENCY) --gcs-stage-timeout $(GCS_STAGE_TIMEOUT) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"

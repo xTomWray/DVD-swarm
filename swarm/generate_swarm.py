@@ -17,6 +17,22 @@ Memory budget (with GCS, default limits):
                                          ~14 instances (--no-gcs)
   32 GB host                          →  ~18 instances (with GCS)
 
+CPU budget (per service, fractional cores):
+  flight-controller : 0.30
+  companion-computer: 0.15
+  ground-control-stn: 0.20
+  simulator         : 0.05
+  ────────────────────────
+  per instance      : 0.70 with GCS, 0.50 without
+
+  64-CPU host →  N=100 with GCS (light oversubscription, acceptable)
+  16-CPU host →  N=17  with GCS
+
+Per-service env overrides (no code changes needed):
+  DVD_MEM_<service>= and DVD_CPU_<service>= (service name uppercased,
+  hyphens → underscores). Example:
+    DVD_CPU_FLIGHT_CONTROLLER=0.50 python3 generate_swarm.py --instances 50
+
 GCS (QGroundControl) is included by default. Pass --no-gcs to omit it and
 fit more instances per host.
 
@@ -51,6 +67,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import socket
 import subprocess
@@ -104,6 +121,22 @@ DEFAULT_MEM: dict[str, str] = {
     "simulator": "256m",  # minimal ROS base + Flask mgmt console
 }
 
+# Per-service CPU caps (fractional cores). Prevent any one container from
+# monopolising the host scheduler — critical at high N where GCS arm and
+# autopilot stages are timing-sensitive.
+#
+# Sized so N=100 fits on a 64-CPU host:
+#   sum per instance (with GCS) = 0.70
+#   ×100 = 70 CPUs — light oversubscription; Docker `cpus:` is a quota, not
+#   a hard reservation, and FC physics + GCS stage scripts are bursty so not
+#   all 100 are hot simultaneously.
+DEFAULT_CPU: dict[str, str] = {
+    "flight-controller":      "0.30",
+    "companion-computer":     "0.15",
+    "ground-control-station": "0.20",
+    "simulator":              "0.05",
+}
+
 # OS + Docker daemon overhead reserved from total host RAM
 _OS_OVERHEAD_GB = 2.0
 
@@ -111,14 +144,27 @@ _OS_OVERHEAD_GB = 2.0
 _MB_PER_INSTANCE_NO_GCS = 1024  # ~1 GB: FC(256) + CC(512) + SIM(256)
 _MB_PER_INSTANCE_WITH_GCS = 1536  # ~1.5 GB: adds GCS(512)
 
+# Per-instance CPU footprint (fractional cores) used for --cpus auto-sizing
+_OS_CPU_OVERHEAD = 4.0
+_CPU_PER_INSTANCE_NO_GCS   = 0.50
+_CPU_PER_INSTANCE_WITH_GCS = 0.70
 
-def _mem_limits(service: str) -> dict[str, str]:
-    """Return mem_limit and memswap_limit keys for a service."""
-    limit = DEFAULT_MEM[service]
+
+def _resource_limits(service: str) -> dict[str, str]:
+    """Return mem_limit, memswap_limit, and cpus keys for a service.
+
+    Env-var overrides per service let operators dial caps without editing
+    code:
+      DVD_MEM_FLIGHT_CONTROLLER=384m make generate INSTANCES=80
+      DVD_CPU_GROUND_CONTROL_STATION=0.30 make generate INSTANCES=60
+    """
+    upper = service.upper().replace("-", "_")
+    mem = os.environ.get(f"DVD_MEM_{upper}", DEFAULT_MEM[service])
+    cpu = os.environ.get(f"DVD_CPU_{upper}", DEFAULT_CPU[service])
     return {
-        "mem_limit": limit,
-        # disable swap to prevent containers from swapping instead of restarting
-        "memswap_limit": limit,
+        "mem_limit":     mem,
+        "memswap_limit": mem,   # disable swap
+        "cpus":          cpu,
     }
 
 
@@ -138,7 +184,7 @@ def flight_controller_service(n: int, raw_dir: Path) -> dict[str, Any]:
             f"dvd-net-{n}": {"ipv4_address": FC_IP_TEMPLATE.format(n=n)},
         },
         "restart": "unless-stopped",
-        **_mem_limits("flight-controller"),
+        **_resource_limits("flight-controller"),
     }
 
 
@@ -201,7 +247,7 @@ def companion_computer_service(n: int, waypoints_dir: Path | None) -> dict[str, 
             f"dvd-net-{n}": {"ipv4_address": CC_IP_TEMPLATE.format(n=n)},
         },
         "restart": "unless-stopped",
-        **_mem_limits("companion-computer"),
+        **_resource_limits("companion-computer"),
     }
 
 
@@ -240,7 +286,7 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
             f"dvd-net-{n}": {"ipv4_address": GCS_IP_TEMPLATE.format(n=n)},
         },
         "restart": "unless-stopped",
-        **_mem_limits("ground-control-station"),
+        **_resource_limits("ground-control-station"),
     }
 
 
@@ -273,7 +319,7 @@ def simulator_service(n: int) -> dict[str, Any]:
             f"dvd-net-{n}": {"ipv4_address": SIM_IP_TEMPLATE.format(n=n)},
         },
         "restart": "unless-stopped",
-        **_mem_limits("simulator"),
+        **_resource_limits("simulator"),
     }
 
 
@@ -305,10 +351,7 @@ def instance_network(n: int) -> dict[str, Any]:
 
 def instance_volumes(n: int) -> dict[str, None]:
     """Return the named volume definitions for instance N."""
-    return {
-        f"dvd-serial-{n}": None,
-        f"dvd-ardupilot-{n}": None,
-    }
+    return {f"dvd-serial-{n}": None}
 
 
 def _is_port_available(port: int) -> bool:
@@ -409,6 +452,13 @@ def instances_for_ram(ram_gb: float, *, include_gcs: bool) -> int:
     return max(1, int(usable_mb // mb_per))
 
 
+def instances_for_cpu(cpus: float, *, include_gcs: bool) -> int:
+    """Return the safe instance count for the given host CPU count."""
+    usable = cpus - _OS_CPU_OVERHEAD
+    per = _CPU_PER_INSTANCE_WITH_GCS if include_gcs else _CPU_PER_INSTANCE_NO_GCS
+    return max(1, int(usable // per))
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate docker-compose.swarm.yml for N DVD litemode instances.",
@@ -427,6 +477,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         metavar="GB",
         help="Auto-size instance count for this much host RAM",
+    )
+
+    parser.add_argument(
+        "--cpus",
+        type=float,
+        metavar="N",
+        help="Auto-size for this many host CPUs. Combined with --ram-gb, the min is used.",
     )
 
     gcs_group = parser.add_mutually_exclusive_group()
@@ -505,13 +562,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     # Resolve instance count
-    if args.ram_gb is not None:
+    if args.cpus is not None and args.ram_gb is not None:
+        n_ram = instances_for_ram(args.ram_gb, include_gcs=args.include_gcs)
+        n_cpu = instances_for_cpu(args.cpus, include_gcs=args.include_gcs)
+        n = min(n_ram, n_cpu)
+        print(f"Auto-sized: {n} instances ({n_ram} by RAM, {n_cpu} by CPU)")
+    elif args.cpus is not None:
+        n = instances_for_cpu(args.cpus, include_gcs=args.include_gcs)
+        print(f"Auto-sized: {n} instances for {args.cpus} CPUs")
+    elif args.ram_gb is not None:
         n = instances_for_ram(args.ram_gb, include_gcs=args.include_gcs)
         print(f"Auto-sized: {n} instances for {args.ram_gb} GB RAM")
     elif args.instances is not None:
         n = args.instances
     else:
-        # Default: safe for a 16 GB host
         n = instances_for_ram(16.0, include_gcs=args.include_gcs)
 
     if n < 1:
