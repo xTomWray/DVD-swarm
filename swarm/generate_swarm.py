@@ -17,16 +17,20 @@ Memory budget (with GCS, default limits):
                                          ~14 instances (--no-gcs)
   32 GB host                          →  ~18 instances (with GCS)
 
-CPU budget (per service, fractional cores):
-  flight-controller : 0.30
-  companion-computer: 0.15
-  ground-control-stn: 0.20
-  simulator         : 0.05
-  ────────────────────────
-  per instance      : 0.70 with GCS, 0.50 without
+CPU caps (per service, fractional cores). These are upper bounds (Docker
+`cpus:` = hard CFS quota), sized for worst-case bursts (SITL firmware load,
+GCS arm/takeoff). Steady-state usage is much lower; auto-sizing below uses
+the steady-state estimate, not the cap.
+  flight-controller : 1.00   (steady ~0.25)
+  companion-computer: 0.50   (steady ~0.05)
+  ground-control-stn: 0.80   (steady ~0.10)
+  simulator         : 0.20   (steady ~0.05)
+  ──────────────────────────────────────────
+  cap sum           : 2.50 with GCS,  1.70 without
+  steady sum        : 0.50 with GCS,  0.35 without
 
-  64-CPU host →  N=100 with GCS (light oversubscription, acceptable)
-  16-CPU host →  N=17  with GCS
+  64-CPU host → N≈120 with GCS by steady-state (cap-oversubscribed but fine)
+  16-CPU host → N≈24  with GCS
 
 Per-service env overrides (no code changes needed):
   DVD_MEM_<service>= and DVD_CPU_<service>= (service name uppercased,
@@ -121,20 +125,25 @@ DEFAULT_MEM: dict[str, str] = {
     "simulator": "256m",  # minimal ROS base + Flask mgmt console
 }
 
-# Per-service CPU caps (fractional cores). Prevent any one container from
-# monopolising the host scheduler — critical at high N where GCS arm and
-# autopilot stages are timing-sensitive.
+# Per-service CPU caps (fractional cores). Goal: prevent any single container
+# from monopolising the host (e.g. runaway Gazebo loop) without artificially
+# starving legitimate bursts.
 #
-# Sized so N=100 fits on a 64-CPU host:
-#   sum per instance (with GCS) = 0.70
-#   ×100 = 70 CPUs — light oversubscription; Docker `cpus:` is a quota, not
-#   a hard reservation, and FC physics + GCS stage scripts are bursty so not
-#   all 100 are hot simultaneously.
+# Docker `cpus:` translates to a HARD CFS quota — a container at cap N can
+# never exceed N cores even if the host has 60 idle. So caps must be sized
+# for the WORST-CASE legitimate burst, not the steady-state average.
+# Specifically: ArduPilot SITL needs ~1 full core for the first 5-10 seconds
+# while loading firmware + sensor models; GCS stage scripts spike when arming.
+#
+# Per-instance sum (with GCS): 2.5. Looks like oversubscription at N=100
+# (250 vs 64 cores) but that's fine — these are CAPS, not reservations.
+# Actual steady-state usage is FC≈0.25, CC≈0.05, GCS≈0.05, SIM≈0.05 once
+# everything is flying. The headroom only matters during transient bursts.
 DEFAULT_CPU: dict[str, str] = {
-    "flight-controller":      "0.30",
-    "companion-computer":     "0.15",
-    "ground-control-station": "0.20",
-    "simulator":              "0.05",
+    "flight-controller":      "1.00",   # full core for SITL startup/physics burst
+    "companion-computer":     "0.50",   # mavlink-router + Flask under attack load
+    "ground-control-station": "0.80",   # stage scripts hammer mavlink at arm/takeoff
+    "simulator":              "0.20",   # mgmt console only
 }
 
 # OS + Docker daemon overhead reserved from total host RAM
@@ -145,9 +154,12 @@ _MB_PER_INSTANCE_NO_GCS = 1024  # ~1 GB: FC(256) + CC(512) + SIM(256)
 _MB_PER_INSTANCE_WITH_GCS = 1536  # ~1.5 GB: adds GCS(512)
 
 # Per-instance CPU footprint (fractional cores) used for --cpus auto-sizing
+# Steady-state (not cap) CPU per instance, used for --cpus auto-sizing.
+# Bursts are higher, but Docker's CFS quota soaks them per-container; what
+# matters for "will the host be saturated" is sustained usage.
 _OS_CPU_OVERHEAD = 4.0
-_CPU_PER_INSTANCE_NO_GCS   = 0.50
-_CPU_PER_INSTANCE_WITH_GCS = 0.70
+_CPU_PER_INSTANCE_NO_GCS   = 0.35
+_CPU_PER_INSTANCE_WITH_GCS = 0.50
 
 
 def _resource_limits(service: str) -> dict[str, str]:
