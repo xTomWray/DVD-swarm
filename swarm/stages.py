@@ -64,18 +64,17 @@ class StageConfig:
     instance: int
     waypoint_file: Path
     takeoff_alt_m: float = 10.0
-    # All timeouts below are deliberately generous. The orchestrator's
-    # outer budget (a single sim run is 3-20 minutes) is the real bound;
-    # per-stage timeouts only exist to bail on genuinely-stuck drones so
-    # one bad drone doesn't hang the whole pool indefinitely. The legacy
-    # arm-and-takeoff.py had effectively no per-stage timeout at all and
-    # always worked, so erring large here just matches that behaviour.
-    mission_request_timeout: float = 60.0
+    # Liveness-based waits — every stage keeps waiting as long as the FC
+    # is sending ANY MAVLink message. Only bails when the FC has gone
+    # silent for `inactivity_timeout` seconds. This matches the legacy
+    # arm-and-takeoff.py "while True" behaviour while still bailing on
+    # a genuinely dead drone so one bad apple doesn't hang the pool.
+    inactivity_timeout: float = 60.0
+    # Mission upload retries. Each retry clears the FC's partial mission
+    # before restarting from waypoint 0.
     mission_upload_retries: int = 3
-    arm_timeout: float = 60.0
-    gps_timeout: float = 120.0
-    ekf_timeout: float = 240.0
-    mode_set_timeout: float = 60.0
+    # TCP socket-open + first HEARTBEAT after open. Distinct from the
+    # liveness timeout: pre-HEARTBEAT there are no messages to time.
     connect_timeout: float = 60.0
 
 
@@ -172,10 +171,9 @@ class Stages:
 
         m.waypoint_clear_all_send()
 
-        # GPS fix (don't fail on timeout — legacy bypasses too; FC can
-        # still be useful even if GPS_RAW_INT is slow to arrive).
+        # GPS fix — non-fatal on inactivity (legacy bypasses GPS timeout too).
         try:
-            self._wait_gps(self.cfg.gps_timeout)
+            self._wait_for("GPS fix", "GPS_RAW_INT", lambda msg: msg.fix_type >= 3)
         except TimeoutError as exc:
             log.warning("Drone %d: %s (continuing — legacy behaviour)", n, exc)
 
@@ -188,13 +186,21 @@ class Stages:
             mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
             mavutil.mavlink.COPTER_MODE_GUIDED,
         )
-        self._wait_for_mode(mavutil.mavlink.COPTER_MODE_GUIDED, self.cfg.mode_set_timeout)
+        self._wait_for(
+            "GUIDED mode",
+            "HEARTBEAT",
+            lambda msg: msg.custom_mode == mavutil.mavlink.COPTER_MODE_GUIDED,
+        )
         log.info("Drone %d: GUIDED mode set", n)
 
-        # EKF — only after the FC is in GUIDED. Legacy had no timeout;
-        # we use a generous one so a stuck drone doesn't hang the whole
-        # pool indefinitely.
-        self._wait_ekf(self.cfg.ekf_timeout)
+        # EKF — keep waiting as long as the FC is sending messages. Some
+        # drones take several minutes to assert POS_HORIZ_ABS at large N;
+        # the legacy script had no timeout at all and always worked.
+        self._wait_for(
+            "EKF POS_HORIZ_ABS",
+            "EKF_STATUS_REPORT",
+            lambda msg: bool(msg.flags & _EKF_POS_HORIZ_ABS),
+        )
         log.info("Drone %d: EKF OK", n)
 
         m.arducopter_arm()
@@ -249,22 +255,29 @@ class Stages:
         )
 
     def _upload_once(self, waypoints: list[tuple[float, float, float]]) -> None:
+        """Upload all *waypoints*, using FC-liveness (not wall-clock) as the
+        bail condition. Each incoming MAVLink message of any type resets
+        the inactivity clock; we only fail if the FC goes silent.
+        """
         assert self._master is not None
         m = self._master
         m.waypoint_clear_all_send()
         m.mav.mission_count_send(m.target_system, m.target_component, len(waypoints))
 
         uploaded = 0
+        last_activity = time.time()
         while uploaded < len(waypoints):
-            msg = m.recv_match(
-                type=["MISSION_REQUEST", "MISSION_REQUEST_INT"],
-                blocking=True,
-                timeout=self.cfg.mission_request_timeout,
-            )
+            msg = m.recv_match(blocking=True, timeout=1)
             if msg is None:
-                raise TimeoutError(
-                    f"MISSION_REQUEST timeout (uploaded {uploaded}/{len(waypoints)})"
-                )
+                if time.time() - last_activity > self.cfg.inactivity_timeout:
+                    raise TimeoutError(
+                        f"FC silent for {self.cfg.inactivity_timeout:.0f}s "
+                        f"(uploaded {uploaded}/{len(waypoints)})"
+                    )
+                continue
+            last_activity = time.time()
+            if msg.get_type() not in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+                continue
             seq = msg.seq
             if seq >= len(waypoints):
                 raise RuntimeError(f"FC requested out-of-range seq {seq}")
@@ -282,11 +295,23 @@ class Stages:
             )
             uploaded = seq + 1
 
-        ack = m.recv_match(type="MISSION_ACK", blocking=True, timeout=10)
-        if ack is None:
-            raise TimeoutError("MISSION_ACK missing")
-        if ack.type != mavutil.mavlink.MAV_MISSION_ACCEPTED:
-            raise RuntimeError(f"MISSION_ACK type={ack.type}")
+        # Same liveness logic for the terminal MISSION_ACK.
+        last_activity = time.time()
+        while True:
+            msg = m.recv_match(blocking=True, timeout=1)
+            if msg is None:
+                if time.time() - last_activity > self.cfg.inactivity_timeout:
+                    raise TimeoutError(
+                        f"FC silent for {self.cfg.inactivity_timeout:.0f}s "
+                        "waiting for MISSION_ACK"
+                    )
+                continue
+            last_activity = time.time()
+            if msg.get_type() != "MISSION_ACK":
+                continue
+            if msg.type != mavutil.mavlink.MAV_MISSION_ACCEPTED:
+                raise RuntimeError(f"MISSION_ACK type={msg.type}")
+            return
 
     def _return_to_land(self) -> None:
         assert self._master is not None
@@ -306,32 +331,36 @@ class Stages:
                 out.append((lat, lon, alt))
         return out
 
-    def _wait_for_mode(self, target_mode: int, timeout: float) -> None:
-        """Block until the FC's HEARTBEAT.custom_mode equals *target_mode*."""
-        assert self._master is not None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = self._master.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
-            if msg and msg.custom_mode == target_mode:
-                return
-        raise TimeoutError(
-            f"drone {self.cfg.instance}: mode {target_mode} not confirmed in {timeout:.0f}s"
-        )
+    def _wait_for(self, label: str, msg_type: str, predicate) -> None:
+        """Wait until the FC sends a *msg_type* satisfying *predicate*.
 
-    def _wait_gps(self, timeout: float) -> None:
-        assert self._master is not None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = self._master.recv_match(type="GPS_RAW_INT", blocking=True, timeout=1)
-            if msg and msg.fix_type >= 3:
-                return
-        raise TimeoutError(f"drone {self.cfg.instance}: GPS fix timeout")
+        Liveness-based: as long as the FC is sending ANY MAVLink message,
+        we keep waiting. Only bails when the FC has been silent for
+        ``inactivity_timeout`` seconds. Mirrors the legacy "while True"
+        wait loops in ground-control-station/stages/arm-and-takeoff.py
+        which always worked.
 
-    def _wait_ekf(self, timeout: float) -> None:
+        Args:
+            label: Short human-readable description for log/error text.
+            msg_type: MAVLink message type to filter on (e.g. "HEARTBEAT").
+            predicate: Callable applied to messages of *msg_type*; returns
+                True to terminate the wait.
+
+        Raises:
+            TimeoutError: If no MAVLink message of any type arrives for
+                ``inactivity_timeout`` seconds — the FC is genuinely dead.
+        """
         assert self._master is not None
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            msg = self._master.recv_match(type="EKF_STATUS_REPORT", blocking=True, timeout=1)
-            if msg and (msg.flags & _EKF_POS_HORIZ_ABS):
+        last_activity = time.time()
+        while True:
+            msg = self._master.recv_match(blocking=True, timeout=1)
+            if msg is None:
+                if time.time() - last_activity > self.cfg.inactivity_timeout:
+                    raise TimeoutError(
+                        f"drone {self.cfg.instance}: FC silent for "
+                        f"{self.cfg.inactivity_timeout:.0f}s while waiting for {label}"
+                    )
+                continue
+            last_activity = time.time()
+            if msg.get_type() == msg_type and predicate(msg):
                 return
-        raise TimeoutError(f"drone {self.cfg.instance}: EKF not OK")

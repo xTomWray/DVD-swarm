@@ -109,19 +109,20 @@ def _parse_args() -> argparse.Namespace:
              "upload retries under host load (default: 12).",
     )
     run_p.add_argument(
-        "--mission-request-timeout",
+        "--inactivity-timeout",
         type=float,
         default=60.0,
-        help="Per-MISSION_REQUEST timeout (seconds) during mission upload. "
-             "The legacy autopilot-flight.py hard-coded 5s, which dropped "
-             "uploads at N≥10 under CPU caps. 60s is safe at N=50 (default: 60).",
+        help="FC silence threshold (seconds) for all Stages wait helpers. "
+             "Each wait keeps going as long as the FC sends ANY MAVLink "
+             "message; only bails after this many seconds of total silence. "
+             "Replaces the per-stage wall-clock timeouts (default: 60).",
     )
     run_p.add_argument(
         "--mission-upload-retries",
         type=int,
         default=3,
-        help="Number of times to re-attempt a full mission upload if a "
-             "MISSION_REQUEST or MISSION_ACK times out. Each retry clears the "
+        help="Number of times to re-attempt a full mission upload if the "
+             "FC goes silent or rejects the mission. Each retry clears the "
              "FC's partial mission first (default: 3 retries = up to 4 attempts).",
     )
     run_p.add_argument(
@@ -538,33 +539,28 @@ _WAYPOINT_FILE = (
 def _drive_stages(
     n: int,
     waypoint_file: Path,
-    mission_request_timeout: float,
+    inactivity_timeout: float,
     mission_upload_retries: int,
 ) -> None:
     """Drive drone *n* from BOOT → AUTO via a host-side MAVLink session.
 
     Replaces the legacy ``docker exec arm-and-takeoff && docker exec
     autopilot-flight`` chain with a single ``Stages`` instance — one
-    pymavlink connection per drone, host-side timeouts, and retryable
-    mission upload (the hard-coded 5s MISSION_REQUEST timeout in the
-    legacy ``autopilot-flight.py`` was the root cause of N≥10 dropouts).
+    pymavlink connection per drone, FC-liveness-based waits (not wall
+    clock), and retryable mission upload.
 
     Args:
         n: Drone instance number (1-based).
         waypoint_file: Path to the host-side waypoints text file.
-        mission_request_timeout: Per-MISSION_REQUEST timeout in seconds.
+        inactivity_timeout: FC-silence threshold for every wait helper.
         mission_upload_retries: Number of upload re-attempts on failure.
-
-    Raises:
-        Exception: Propagates any unrecoverable stage failure (caught by
-            the orchestrator and logged per-drone).
     """
     from swarm.stages import StageConfig, Stages
 
     cfg = StageConfig(
         instance=n,
         waypoint_file=waypoint_file,
-        mission_request_timeout=mission_request_timeout,
+        inactivity_timeout=inactivity_timeout,
         mission_upload_retries=mission_upload_retries,
     )
     stages = Stages(cfg)
@@ -739,9 +735,9 @@ def main() -> int:
         # active uploads share host I/O and slow MISSION_REQUEST round-trips.
         gcs_workers = max(1, min(len(drone_ids), args.gcs_concurrency))
         log.info(
-            "Driving %d drone(s) to AUTO (concurrency=%d, mission_request_timeout=%.0fs, retries=%d)…",
+            "Driving %d drone(s) to AUTO (concurrency=%d, inactivity_timeout=%.0fs, retries=%d)…",
             len(drone_ids), gcs_workers,
-            args.mission_request_timeout, args.mission_upload_retries,
+            args.inactivity_timeout, args.mission_upload_retries,
         )
         with ThreadPoolExecutor(max_workers=gcs_workers) as pool:
             futures_arm = {
@@ -749,7 +745,7 @@ def main() -> int:
                     _drive_stages,
                     n,
                     _WAYPOINT_FILE,
-                    args.mission_request_timeout,
+                    args.inactivity_timeout,
                     args.mission_upload_retries,
                 ): n
                 for n in drone_ids

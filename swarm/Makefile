@@ -45,7 +45,7 @@ help:
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel host-side Stages workers"
 	@echo "    STAGE1_CONCURRENCY=16       (default 16) — lower to 8 if docker exec contention at N=100+"
-	@echo "    MISSION_REQUEST_TIMEOUT=120 (default 60) — bump if mission upload retries appear in logs"
+	@echo "    INACTIVITY_TIMEOUT=120      (default 60) — FC-silence cap for all Stages waits"
 	@echo "    MISSION_UPLOAD_RETRIES=5    (default 3)  — bump if all retries exhausted"
 	@echo "    READINESS_PROBE_TIMEOUT=10  (default 5)  — bump if 0 drones reach HEARTBEAT at large N"
 	@echo "    READINESS_TOTAL_TIMEOUT=600 (default 0 = auto: max(180, 60×ceil(N/10)))"
@@ -152,7 +152,7 @@ END                      ?= 1200
 ATTACK                   ?= attitude-spoof
 GCS_CONCURRENCY          ?= 12
 STAGE1_CONCURRENCY       ?= 16
-MISSION_REQUEST_TIMEOUT  ?= 60
+INACTIVITY_TIMEOUT       ?= 60
 MISSION_UPLOAD_RETRIES   ?= 3
 READINESS_PROBE_TIMEOUT  ?= 5
 READINESS_TOTAL_TIMEOUT  ?= 0
@@ -162,7 +162,7 @@ READINESS_TOTAL_TIMEOUT  ?= 0
 _SIM_FLAGS = \
     --gcs-concurrency $(GCS_CONCURRENCY) \
     --stage1-concurrency $(STAGE1_CONCURRENCY) \
-    --mission-request-timeout $(MISSION_REQUEST_TIMEOUT) \
+    --inactivity-timeout $(INACTIVITY_TIMEOUT) \
     --mission-upload-retries $(MISSION_UPLOAD_RETRIES) \
     --readiness-probe-timeout $(READINESS_PROBE_TIMEOUT) \
     --readiness-total-timeout $(READINESS_TOTAL_TIMEOUT)
