@@ -99,6 +99,13 @@ SERVICE_PREFIXES = (
 # ── Subnet allocation ─────────────────────────────────────────────────────────
 # Instance N gets subnet 10.13.N.0/24 with services on .2–.5
 
+# Repo root, anchored to this file's location — independent of CWD so the
+# compose file gets the same absolute bind-mount paths whether the user runs
+# `python generate_swarm.py` from swarm/ (via `make generate`) or from the
+# project root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
 SUBNET_TEMPLATE = "10.13.{n}.0/24"
 FC_IP_TEMPLATE = "10.13.{n}.2"
 CC_IP_TEMPLATE = "10.13.{n}.3"
@@ -227,11 +234,11 @@ def companion_computer_service(n: int, waypoints_dir: Path | None) -> dict[str, 
     # Patch out rospy.init_node — hangs when there is no ROS master.
     # The upstream image includes camera_bp which imports rospy; removing it
     # lets Flask bind to port 3000 and the telemetry pipeline work normally.
-    _app_patch = str(Path("companion-computer/interface/app.py").resolve())
+    _app_patch = str(_REPO_ROOT / "companion-computer/interface/app.py")
     # Patch telemetry.py: replace blocking communicate() with non-blocking Popen
     # so the Flask thread is never stuck and mavlink-routerd log output can't
     # accumulate in memory causing GC pauses → Socket.IO connection drops.
-    _telemetry_patch = str(Path("companion-computer/interface/routes/telemetry.py").resolve())
+    _telemetry_patch = str(_REPO_ROOT / "companion-computer/interface/routes/telemetry.py")
     volumes: list[str] = [
         f"dvd-serial-{n}:/sockets",
         f"{_app_patch}:/interface/app.py:ro",
@@ -270,8 +277,8 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
     HEADLESS=1 instructs QGC to run without a display server.
     """
     logs_path = str((raw_dir / f"instance-{n}").resolve())
-    _stages = str(Path("ground-control-station/stages").resolve())
-    _missions = str(Path("ground-control-station/missions").resolve())
+    _stages = str(_REPO_ROOT / "ground-control-station/stages")
+    _missions = str(_REPO_ROOT / "ground-control-station/missions")
     return {
         "image": IMAGES["ground-control-station"],
         "container_name": f"ground-control-station-lite-{n}",
@@ -321,8 +328,11 @@ def simulator_service(n: int) -> dict[str, Any]:
             f"SWARM_INSTANCE={n}",
         ],
         "volumes": [
-            # mgmt scripts are read-only and shared across all instances
-            "./simulator/mgmt:/app/simulator/mgmt:ro",
+            # mgmt scripts are read-only and shared across all instances.
+            # Absolute path because docker compose resolves relative paths
+            # against the compose-file location (swarm/), but simulator/
+            # lives at the repo root one level up.
+            f"{_REPO_ROOT / 'simulator/mgmt'}:/app/simulator/mgmt:ro",
             # Docker socket needed by the simulator management console
             "/var/run/docker.sock:/var/run/docker.sock",
         ],
