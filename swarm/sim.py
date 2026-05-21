@@ -100,6 +100,22 @@ def _parse_args() -> argparse.Namespace:
              "to drop failed drones and continue with the rest — recommended "
              "at large N where 5-10%% transient failures are common.",
     )
+    run_p.add_argument(
+        "--gcs-concurrency",
+        type=int,
+        default=12,
+        help="Max parallel docker-exec invocations for the GCS arm + autopilot "
+             "stages. Lower if you see widespread autopilot-flight.py exit 1 "
+             "warnings under host load (default: 12).",
+    )
+    run_p.add_argument(
+        "--gcs-stage-timeout",
+        type=float,
+        default=300.0,
+        help="Per-stage subprocess timeout (seconds) for each GCS Python "
+             "script. Raise if autopilot-flight legitimately needs longer "
+             "to upload + run + verify the mission at scale (default: 300).",
+    )
 
     return parser.parse_args()
 
@@ -467,12 +483,13 @@ def _wait_for_swarm_ready(
 # ---------------------------------------------------------------------------
 
 
-def _arm_and_autopilot(n: int, log_dir: Path) -> None:
+def _arm_and_autopilot(n: int, log_dir: Path, stage_timeout: float = 300.0) -> None:
     """Execute arm-and-takeoff then autopilot-flight GCS stages for drone *n*.
 
     Args:
         n: Drone instance number (1-based).
         log_dir: Directory where GCS stage stdout/stderr is written.
+        stage_timeout: Per-stage subprocess timeout in seconds.
 
     Raises:
         subprocess.CalledProcessError: When either stage exits non-zero.
@@ -487,15 +504,15 @@ def _arm_and_autopilot(n: int, log_dir: Path) -> None:
                 result = subprocess.run(
                     ["docker", "exec", container, "python3", f"/opt/gcs/stages/{stage}"],
                     capture_output=True,
-                    timeout=180,
+                    timeout=stage_timeout,
                 )
             except subprocess.TimeoutExpired as exc:
-                lf.write(f"=== {stage} TIMEOUT after 180s ===\n".encode())
+                lf.write(f"=== {stage} TIMEOUT after {stage_timeout:.0f}s ===\n".encode())
                 if exc.stdout:
                     lf.write(exc.stdout)
                 if exc.stderr:
                     lf.write(exc.stderr)
-                log.warning("Drone %d %s timed out after 180s", n, stage)
+                log.warning("Drone %d %s timed out after %.0fs", n, stage, stage_timeout)
                 continue
             lf.write(f"=== {stage} exit={result.returncode} ===\n".encode())
             lf.write(result.stdout)
@@ -646,13 +663,21 @@ def main() -> int:
         log.info("Capture started (epoch %.3f).", capture_start_epoch)
 
         # Phase 7: push ready drones through GCS flight stages in parallel.
-        log.info("Arming and launching %d drone(s)…", len(drone_ids))
-        with ThreadPoolExecutor(max_workers=min(len(drone_ids), 32)) as pool:
+        # max_workers is intentionally lower than the readiness probes because
+        # the GCS stages drive sustained MAVLink I/O — too many concurrent
+        # autopilot-flight runs cause MAVLink ACK timeouts on a busy host.
+        gcs_workers = max(1, min(len(drone_ids), args.gcs_concurrency))
+        log.info(
+            "Arming and launching %d drone(s) (concurrency=%d, stage timeout=%.0fs)…",
+            len(drone_ids), gcs_workers, args.gcs_stage_timeout,
+        )
+        with ThreadPoolExecutor(max_workers=gcs_workers) as pool:
             futures_arm = {
                 pool.submit(
                     _arm_and_autopilot,
                     n,
                     output_dir / "logs" / f"instance-{n}",
+                    args.gcs_stage_timeout,
                 ): n
                 for n in drone_ids
             }
