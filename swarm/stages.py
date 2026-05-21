@@ -68,6 +68,14 @@ class StageConfig:
     mission_upload_retries: int = 2
     arm_timeout: float = 30.0
     gps_timeout: float = 60.0
+    # EKF takes longer to assert POS_HORIZ_ABS at N≥10 cold-boot than 30s —
+    # 9/10 drones hit the 30s wait in observed runs while one lucky drone
+    # got there in ~40s. The legacy arm-and-takeoff.py had NO ekf timeout
+    # (while True) which is how it always succeeded.
+    ekf_timeout: float = 120.0
+    # The "wait for COPTER_MODE_GUIDED confirmation HEARTBEAT" loop in the
+    # legacy script could spin briefly; 30s is plenty.
+    mode_set_timeout: float = 30.0
     connect_timeout: float = 30.0
 
 
@@ -151,13 +159,43 @@ class Stages:
         raise TimeoutError(f"drone {n}: no HEARTBEAT on {self.endpoint}")
 
     def _guided_arm_takeoff(self) -> None:
+        """Mirror ground-control-station/stages/arm-and-takeoff.py exactly.
+
+        Order matters: GPS fix before mode-set, mode-set confirmed via
+        HEARTBEAT before EKF wait. The reversed order (GUIDED-then-GPS)
+        appears to delay EKF POS_HORIZ_ABS assertion at N≥10 — only 1 of
+        10 drones got there inside 30 s in observed runs.
+        """
         assert self._master is not None
         m = self._master
         n = self.cfg.instance
 
-        m.set_mode("GUIDED")
-        self._wait_gps(self.cfg.gps_timeout)
-        self._wait_ekf(self.cfg.arm_timeout)
+        m.waypoint_clear_all_send()
+
+        # GPS fix (don't fail on timeout — legacy bypasses too; FC can
+        # still be useful even if GPS_RAW_INT is slow to arrive).
+        try:
+            self._wait_gps(self.cfg.gps_timeout)
+        except TimeoutError as exc:
+            log.warning("Drone %d: %s (continuing — legacy behaviour)", n, exc)
+
+        # GUIDED — use the legacy set_mode_send + wait_for_mode pattern
+        # rather than mavutil.set_mode (different MAVLink message + no
+        # confirmation), so the FC has actually transitioned before we
+        # poll EKF status.
+        m.mav.set_mode_send(
+            m.target_system,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            mavutil.mavlink.COPTER_MODE_GUIDED,
+        )
+        self._wait_for_mode(mavutil.mavlink.COPTER_MODE_GUIDED, self.cfg.mode_set_timeout)
+        log.info("Drone %d: GUIDED mode set", n)
+
+        # EKF — only after the FC is in GUIDED. Legacy had no timeout;
+        # we use a generous one so a stuck drone doesn't hang the whole
+        # pool indefinitely.
+        self._wait_ekf(self.cfg.ekf_timeout)
+        log.info("Drone %d: EKF OK", n)
 
         m.arducopter_arm()
         m.motors_armed_wait()
@@ -267,6 +305,18 @@ class Stages:
                 lat, lon, alt = (float(x) for x in line.split(","))
                 out.append((lat, lon, alt))
         return out
+
+    def _wait_for_mode(self, target_mode: int, timeout: float) -> None:
+        """Block until the FC's HEARTBEAT.custom_mode equals *target_mode*."""
+        assert self._master is not None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self._master.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+            if msg and msg.custom_mode == target_mode:
+                return
+        raise TimeoutError(
+            f"drone {self.cfg.instance}: mode {target_mode} not confirmed in {timeout:.0f}s"
+        )
 
     def _wait_gps(self, timeout: float) -> None:
         assert self._master is not None
