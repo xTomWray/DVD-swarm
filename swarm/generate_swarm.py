@@ -277,7 +277,6 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
     HEADLESS=1 instructs QGC to run without a display server.
     """
     logs_path = str((raw_dir / f"instance-{n}").resolve())
-    _stages = str(_REPO_ROOT / "ground-control-station/stages")
     _missions = str(_REPO_ROOT / "ground-control-station/missions")
     # Patched autopilot-flight.py overlays the upstream copy at runtime.
     # Reads MISSION_REQUEST_TIMEOUT, MISSION_ACK_TIMEOUT, MISSION_UPLOAD_RETRIES
@@ -308,15 +307,13 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
             "/etc/machine-id:/etc/machine-id:ro",
             # Read-only access to FC logs for post-flight-analysis.py (Stage 5)
             f"{logs_path}:/ardupilot/logs:ro",
-            # Patch all stage scripts (fixes autopilot, takeoff altitude, post-flight analysis)
-            f"{_stages}:/opt/gcs/stages:ro",
             # Patch missions (adds zigzag waypoints at 10m / ~55m spacing)
             f"{_missions}:/opt/gcs/missions:ro",
-            # Single-file overlay of our patched autopilot-flight.py on top of
-            # the directory mount above. Docker honours single-file binds over
-            # directory binds when listed last, so /opt/gcs/stages/* still
-            # comes from ground-control-station/stages EXCEPT autopilot-flight.py
-            # which comes from swarm/gcs_patches/.
+            # Overlay patched autopilot-flight.py over the image-baked copy.
+            # No directory mount for stages/ — a single-file bind on top of
+            # a directory bind doesn't work on Docker Desktop WSL2; without the
+            # directory mount the image's baked-in scripts are used for all
+            # other stages and only this file is replaced.
             f"{_autopilot_patch}:/opt/gcs/stages/autopilot-flight.py:ro",
         ],
         "networks": {
