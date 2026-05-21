@@ -79,3 +79,4 @@ configs/data/raw/instance-*/
 !configs/data/raw/.gitkeep
 
 logs/
+archives/

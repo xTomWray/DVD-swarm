@@ -12,7 +12,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -44,6 +44,16 @@ help:
 	@echo ""
 	@echo "  make follow"
 	@echo "      tail -f the most-recent logs/*.log file."
+	@echo ""
+	@echo "  make archive [NAME=label]"
+	@echo "      tar+gzip all output/run_* (and matching logs/) into"
+	@echo "      archives/<UTC>[_<NAME>].tar.gz, then delete the originals."
+	@echo ""
+	@echo "  make restore ARCHIVE=archives/<file>.tar.gz"
+	@echo "      Extract a past archive back into output/ for re-training."
+	@echo ""
+	@echo "  make list-archives"
+	@echo "      Show all archives with sizes."
 	@echo ""
 	@echo "Detached usage (so your terminal stays free):"
 	@echo "  nohup make sim-benign N=50 END=300 RUNS=5 > /dev/null 2>&1 &"
@@ -210,6 +220,67 @@ sim-random:
 	        --attack $(ATTACK) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"
+
+# ── Archival ──────────────────────────────────────────────────────────────────
+# Workflow:
+#   make sim-benign N=50 ...    # generates runs in output/
+#   ... data accumulates ...
+#   make archive NAME=benign-baseline   # rolls it all into archives/, clears output/
+#   make sim-random N=15 ...    # next session starts with a clean output/
+#
+# To re-train on a past session:
+#   make restore ARCHIVE=archives/20260520T020415Z_benign-baseline.tar.gz
+#   python swarm/biLSTM-2Layer-Protocol.py --data-dir output/ ...
+
+# Tar+gzip every output/run_* (plus matching logs/sim-*.log) into
+# archives/<UTC>[_<NAME>].tar.gz then remove the originals.
+# Set NAME=<label> to add a human-readable suffix to the archive filename.
+NAME ?=
+archive:
+	@cd .. && \
+	if [ -z "$$(ls -d output/run_* 2>/dev/null)" ]; then \
+	    echo "Nothing to archive — output/ has no run_* dirs."; \
+	    exit 0; \
+	fi; \
+	mkdir -p archives && \
+	STAMP=$$(date -u +%Y%m%dT%H%M%SZ); \
+	NAME_SUFFIX=""; \
+	if [ -n "$(NAME)" ]; then NAME_SUFFIX="_$(NAME)"; fi; \
+	ARCHIVE="archives/$${STAMP}$${NAME_SUFFIX}.tar.gz"; \
+	N=$$(ls -d output/run_* | wc -l); \
+	echo "[make] archiving $$N run dir(s) -> $$ARCHIVE"; \
+	set -o pipefail; \
+	tar -czf "$$ARCHIVE" output/run_* $$(ls logs/sim-*.log logs/sim_*.log 2>/dev/null) 2>&1 | tail -5 ; \
+	echo "[make] removing originals"; \
+	rm -rf output/run_*; \
+	echo "[make] done. $$ARCHIVE ($$(du -h "$$ARCHIVE" | cut -f1))"
+
+# Extract a past archive back into output/. Existing run_* dirs aren't
+# disturbed (timestamps in dir names prevent collisions).
+restore:
+	@if [ -z "$(ARCHIVE)" ]; then \
+	    echo "ERROR: pass ARCHIVE=archives/<file>.tar.gz"; \
+	    echo "Available:"; \
+	    ls -1 ../archives/*.tar.gz 2>/dev/null | sed 's/^/  /'; \
+	    exit 1; \
+	fi
+	@cd .. && \
+	if [ ! -f "$(ARCHIVE)" ]; then \
+	    echo "ERROR: archive not found: $(ARCHIVE)"; exit 1; \
+	fi; \
+	echo "[make] extracting $(ARCHIVE)…"; \
+	tar -xzf "$(ARCHIVE)" && \
+	echo "[make] done. Run dirs now in output/:"; \
+	ls -d output/run_* 2>/dev/null | tail -10
+
+# List archives newest first with file sizes.
+list-archives:
+	@cd .. && \
+	if [ -z "$$(ls archives/*.tar.gz 2>/dev/null)" ]; then \
+	    echo "No archives yet. Use 'make archive' to create one."; \
+	else \
+	    ls -lhS archives/*.tar.gz | awk '{print $$5, $$9}'; \
+	fi
 
 # Tail the most-recent log file under <project_root>/logs/. Handy when
 # you've launched a sim with `nohup make sim-X ... > /dev/null 2>&1 &` and
