@@ -82,15 +82,10 @@ def stage1():
             "-A '--serial0=uart:/dev/ttyACM0:57600'"
         )
 
-    logger.info("Executing: %s", command)
+    logger.info("Executing (detached): %s", command)
 
-    output_stream = []
-    for chunk in container.exec_run(command, stream=True):
-        line = (
-            chunk.decode(errors="ignore") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
-        )
-        logger.info("[sitl] %s", line.strip())
-        output_stream.append(line)
+    container.exec_run(command, detach=True)
+    logger.info("Stage 1: dispatched %s on %s (detached)", command, container.name)
 
     logger.info("Starting MAVLink Router on Companion…")
     data = {
@@ -109,7 +104,7 @@ def stage1():
 
     return render_template(
         "pages/simulator.html",
-        output=output_stream,
+        output="Stage 1 dispatched (SITL starting in background)",
         current_page="home",
         LITE=LITE,
         cc_url=CC_URL_PUBLIC,

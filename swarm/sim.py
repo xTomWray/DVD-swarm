@@ -117,6 +117,16 @@ def _parse_args() -> argparse.Namespace:
              "to upload + run + verify the mission at scale (default: 300).",
     )
     run_p.add_argument(
+        "--stage1-concurrency",
+        type=int,
+        default=16,
+        help="Max parallel POST /stage1 invocations to simulator-lite containers "
+             "(boots arducopter inside each FC container). Was serial before — at "
+             "N=50 serial × 60s timeout = ~50 min wallclock, exhausting the "
+             "HEARTBEAT budget. Default 16 keeps the whole Stage 1 phase under ~3 "
+             "min at N=50 (default: 16).",
+    )
+    run_p.add_argument(
         "--readiness-probe-timeout",
         type=float,
         default=5.0,
@@ -427,6 +437,7 @@ def _wait_for_swarm_ready(
     total_timeout: float,
     *,
     allow_partial: bool = False,
+    stage1_concurrency: int = 16,
 ) -> set[int]:
     """Bring the swarm to a state where GCS stages can run.
 
@@ -479,16 +490,21 @@ def _wait_for_swarm_ready(
         per_instance_timeout, total_timeout, allow_partial=allow_partial,
     )
 
+    workers = max(1, min(len(ready), stage1_concurrency))
+    log.info("Triggering Stage 1 on %d drone(s) (%d parallel)…", len(ready), workers)
     staged: set[int] = set()
-    for n in sorted(ready):
-        try:
-            _trigger_stage1(n)
-            staged.add(n)
-        except Exception as exc:
-            if allow_partial:
-                log.warning("Drone %d: failed to trigger stage1: %s", n, exc)
-            else:
-                raise
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_trigger_stage1, n): n for n in sorted(ready)}
+        for fut in as_completed(futures):
+            n = futures[fut]
+            try:
+                fut.result()
+                staged.add(n)
+            except Exception as exc:
+                if allow_partial:
+                    log.warning("Drone %d: failed to trigger stage1: %s", n, exc)
+                else:
+                    raise
 
     # SITL needs ~5–15s to start emitting heartbeats. Use a longer per-probe
     # timeout here so each attempt actually has time to receive one.
@@ -656,6 +672,7 @@ def main() -> int:
             per_instance_timeout=args.readiness_probe_timeout,
             total_timeout=readiness_total,
             allow_partial=not args.strict,
+            stage1_concurrency=args.stage1_concurrency,
         )
         if not ready_drones:
             raise RuntimeError("No drones reached HEARTBEAT readiness — aborting.")
@@ -774,6 +791,33 @@ def main() -> int:
         if writer is not None:
             writer.close()
             log.info("Writer closed. Row counts: %s", writer.counts)
+
+        if windows:
+            labeled = 0
+            csv_dir = output_dir / "csv"
+            for csv_path in csv_dir.glob("drone_*.csv"):
+                try:
+                    with open(csv_path) as fh:
+                        header = fh.readline().rstrip("\n").split(",")
+                        try:
+                            idx = header.index("attack_type")
+                        except ValueError:
+                            continue
+                        for line in fh:
+                            cells = line.rstrip("\n").split(",")
+                            if idx < len(cells) and cells[idx] != "null":
+                                labeled += 1
+                except OSError as exc:
+                    log.warning("Label check: could not read %s: %s", csv_path, exc)
+            log.info(
+                "Label coverage: %d row(s) with non-null attack_type across %d attack window(s)",
+                labeled, len(windows),
+            )
+            if labeled == 0:
+                log.warning(
+                    "Attack run produced ZERO labeled rows — biLSTM will train on all-benign "
+                    "data. Check --start/--end window timing and --targets vs ready_drones."
+                )
 
         # Phase 12: collect ArduPilot flight-controller logs.
         # Source is per-run raw_dir (output_dir/raw/instance-N) so we don't

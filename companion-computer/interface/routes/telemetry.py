@@ -1,5 +1,6 @@
 import logging
 import subprocess
+import time
 
 import serial.tools.list_ports
 from extensions import db
@@ -59,14 +60,30 @@ def start_telemetry():
         # Start mavlink-routerd as a background daemon — do NOT call communicate()
         # (communicate() blocks forever since mavlink-routerd never exits normally,
         # and buffering all its output in memory causes GC pauses → Socket.IO drops)
-        process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        # Brief pause to catch an immediate crash (bad device path, port conflict, etc.)
-        import time as _time
-
-        _time.sleep(0.3)
-        if process.poll() is not None and process.returncode != 0:
-            raise RuntimeError(f"mavlink-routerd exited immediately (code {process.returncode})")
+        #
+        # Retry up to 30 times (1s apart) to ride out the ~15s FC socat PTY race:
+        # the FC container sleeps 15s after socat starts before the PTY is ready,
+        # so mavlink-routerd can die immediately at cold-boot when N=50.
+        last_exit = None
+        process = None
+        for attempt in range(30):
+            process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
+            if process.poll() is None:
+                # Still alive — survived the immediate-crash window
+                logging.info(
+                    f"mavlink-routerd started: pid={process.pid} attempt={attempt + 1}"
+                )
+                break
+            last_exit = process.returncode
+            logging.debug(
+                f"mavlink-routerd attempt {attempt + 1}/30 failed (exit {last_exit}); retrying"
+            )
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(
+                f"mavlink-routerd failed to start after 30 attempts (last exit {last_exit})"
+            )
 
         # Update the telemetry status in the database
         telemetry_status_record = TelemetryStatus.query.first()
@@ -77,7 +94,12 @@ def start_telemetry():
         db.session.add(telemetry_status_record)
         db.session.commit()
 
-        return jsonify({"status": "Telemetry started", "cmd": " ".join(cmd)})
+        return jsonify({
+            "status": "Telemetry started",
+            "cmd": " ".join(cmd),
+            "pid": process.pid,
+            "attempt": attempt + 1,
+        })
     except Exception as e:
         logging.error(f"Failed to start telemetry: {str(e)}")
         return jsonify({"error": str(e)}), 500
