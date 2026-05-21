@@ -49,13 +49,15 @@ help:
 	@echo "  make follow"
 	@echo "      tail -f the most-recent logs/*.log file."
 	@echo ""
-	@echo "  make archive [NAME=label]"
-	@echo "      tar+gzip all output/run_* (and matching logs/) into"
-	@echo "      archives/<UTC>[_<NAME>].tar.gz, then delete the originals."
+	@echo "  make archive [NAME=label] [KEEP_RAW=0] [ZSTD_LEVEL=10]"
+	@echo "      tar+zstd all output/run_* (and matching logs/) into"
+	@echo "      archives/<UTC>[_<NAME>].tar.zst, then delete the originals."
 	@echo "    KEEP_RAW=0            strip per-run raw/ dirs before archiving (smaller archive)"
+	@echo "    ZSTD_LEVEL=10         compression level (1=fastest, 19=smallest; default 10)"
 	@echo ""
-	@echo "  make restore ARCHIVE=archives/<file>.tar.gz"
+	@echo "  make restore ARCHIVE=archives/<file>.tar.zst"
 	@echo "      Extract a past archive back into output/ for re-training."
+	@echo "      (Also accepts legacy .tar.gz archives — tar auto-detects.)"
 	@echo ""
 	@echo "  make list-archives"
 	@echo "      Show all archives with sizes."
@@ -239,14 +241,18 @@ sim-random:
 #   make sim-random N=15 ...    # next session starts with a clean output/
 #
 # To re-train on a past session:
-#   make restore ARCHIVE=archives/20260520T020415Z_benign-baseline.tar.gz
+#   make restore ARCHIVE=archives/20260520T020415Z_benign-baseline.tar.zst
 #   python swarm/biLSTM-2Layer-Protocol.py --data-dir output/ ...
 
-# Tar+gzip every output/run_* (plus matching logs/sim-*.log) into
-# archives/<UTC>[_<NAME>].tar.gz then remove the originals.
-# Set NAME=<label> to add a human-readable suffix to the archive filename.
-NAME     ?=
-KEEP_RAW ?= 1
+# Tar+zstd every output/run_* (plus matching logs/sim-*.log) into
+# archives/<UTC>[_<NAME>].tar.zst then remove the originals.
+#
+# zstd -T0 -<level> saturates all host cores; level 10 is a good archival
+# balance (smaller than gzip, ~3-5x faster on multi-GB datasets). Override
+# with ZSTD_LEVEL=19 for max compression or ZSTD_LEVEL=3 for fast packing.
+NAME       ?=
+KEEP_RAW   ?= 1
+ZSTD_LEVEL ?= 10
 archive:
 	@cd .. && \
 	if [ -z "$$(ls -d output/run_* 2>/dev/null)" ]; then \
@@ -257,29 +263,31 @@ archive:
 	STAMP=$$(date -u +%Y%m%dT%H%M%SZ); \
 	NAME_SUFFIX=""; \
 	if [ -n "$(NAME)" ]; then NAME_SUFFIX="_$(NAME)"; fi; \
-	ARCHIVE="archives/$${STAMP}$${NAME_SUFFIX}.tar.gz"; \
+	ARCHIVE="archives/$${STAMP}$${NAME_SUFFIX}.tar.zst"; \
 	N=$$(ls -d output/run_* | wc -l); \
 	TOTAL_KB=$$(du -ks output/run_* 2>/dev/null | awk '{s+=$$1} END {print s+0}'); \
 	EXCLUDE=""; \
 	if [ "$(KEEP_RAW)" = "0" ]; then EXCLUDE="--exclude=output/run_*/raw"; fi; \
-	echo "[make] archiving $$N run dir(s) (~$$((TOTAL_KB/1024)) MB raw, KEEP_RAW=$(KEEP_RAW)) -> $$ARCHIVE"; \
+	echo "[make] archiving $$N run dir(s) (~$$((TOTAL_KB/1024)) MB raw, KEEP_RAW=$(KEEP_RAW), zstd -T0 -$(ZSTD_LEVEL)) -> $$ARCHIVE"; \
 	set -o pipefail; \
 	tar $$EXCLUDE \
 	    --checkpoint=2000 \
 	    --checkpoint-action=ttyout='  %T{%H:%M:%S} %{r}T processed (%s archived)\n' \
-	    -czf "$$ARCHIVE" \
+	    -I 'zstd -T0 -$(ZSTD_LEVEL)' \
+	    -cf "$$ARCHIVE" \
 	    output/run_* $$(ls logs/sim-*.log logs/sim_*.log 2>/dev/null); \
 	echo "[make] removing originals"; \
 	rm -rf output/run_*; \
 	echo "[make] done. $$ARCHIVE ($$(du -h "$$ARCHIVE" | cut -f1))"
 
 # Extract a past archive back into output/. Existing run_* dirs aren't
-# disturbed (timestamps in dir names prevent collisions).
+# disturbed (timestamps in dir names prevent collisions). `tar -xf` auto-
+# detects compression, so both legacy .tar.gz and new .tar.zst work.
 restore:
 	@if [ -z "$(ARCHIVE)" ]; then \
-	    echo "ERROR: pass ARCHIVE=archives/<file>.tar.gz"; \
+	    echo "ERROR: pass ARCHIVE=archives/<file>.tar.{zst,gz}"; \
 	    echo "Available:"; \
-	    ls -1 ../archives/*.tar.gz 2>/dev/null | sed 's/^/  /'; \
+	    ls -1 ../archives/*.tar.zst ../archives/*.tar.gz 2>/dev/null | sed 's/^/  /'; \
 	    exit 1; \
 	fi
 	@cd .. && \
@@ -287,17 +295,18 @@ restore:
 	    echo "ERROR: archive not found: $(ARCHIVE)"; exit 1; \
 	fi; \
 	echo "[make] extracting $(ARCHIVE)…"; \
-	tar -xzf "$(ARCHIVE)" && \
+	tar -xf "$(ARCHIVE)" && \
 	echo "[make] done. Run dirs now in output/:"; \
 	ls -d output/run_* 2>/dev/null | tail -10
 
-# List archives newest first with file sizes.
+# List archives newest first with file sizes. Shows both legacy .tar.gz
+# and new .tar.zst.
 list-archives:
 	@cd .. && \
-	if [ -z "$$(ls archives/*.tar.gz 2>/dev/null)" ]; then \
+	if [ -z "$$(ls archives/*.tar.zst archives/*.tar.gz 2>/dev/null)" ]; then \
 	    echo "No archives yet. Use 'make archive' to create one."; \
 	else \
-	    ls -lhS archives/*.tar.gz | awk '{print $$5, $$9}'; \
+	    ls -lhS archives/*.tar.zst archives/*.tar.gz 2>/dev/null | awk '{print $$5, $$9}'; \
 	fi
 
 # Tail the most-recent log file under <project_root>/logs/. Handy when
