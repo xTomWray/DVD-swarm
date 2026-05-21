@@ -155,13 +155,19 @@ def _resolve_output_dir(args: argparse.Namespace) -> Path:
         args: Parsed CLI arguments.
 
     Returns:
-        Resolved :class:`pathlib.Path` for the output directory.
+        Resolved :class:`pathlib.Path` for the output directory. Default
+        format is ``output/run_<UTC>_<attack>_n<N>_s<START>_e<END>`` so the
+        directory name alone identifies the experiment's swarm size and
+        attack-window timing.
     """
     if args.output:
         return Path(args.output)
     ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     attack_slug = args.attack.replace("-", "_")
-    return Path(f"output/run_{ts}_{attack_slug}_n{args.size}")
+    return Path(
+        f"output/run_{ts}_{attack_slug}"
+        f"_n{args.size}_s{int(args.start)}_e{int(args.end)}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +564,17 @@ def main() -> int:
     output_dir = _resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Per-run logfile inside the output dir. Every log.* call from any module
+    # in this process now writes to <output_dir>/sim.log as well as stdout.
+    # Subprocess output (docker compose, etc.) still only hits stdout — for
+    # that, look at the make-loop log under logs/.
+    run_log_handler = logging.FileHandler(output_dir / "sim.log", mode="w")
+    run_log_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    run_log_handler.setLevel(logging.INFO)
+    logging.getLogger().addHandler(run_log_handler)
+
     log.info("Output directory: %s", output_dir)
 
     # Phase 2: generate mission and deploy to GCS mount path.
@@ -778,6 +795,11 @@ def main() -> int:
         }
         (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
         log.info("Metadata written to %s/metadata.json", output_dir)
+
+        # Detach + close the per-run file handler so the log file's last
+        # buffered lines flush before the process exits.
+        logging.getLogger().removeHandler(run_log_handler)
+        run_log_handler.close()
 
     return 0
 
