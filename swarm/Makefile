@@ -272,7 +272,7 @@ archive:
 	set -o pipefail; \
 	tar $$EXCLUDE \
 	    --checkpoint=2000 \
-	    --checkpoint-action=ttyout='  %T{%H:%M:%S} %{r}T processed (%s archived)\n' \
+	    --checkpoint-action=ttyout='  [%{%H:%M:%S}T] cp %u  %{w}T\n' \
 	    -I 'zstd -T0 -$(ZSTD_LEVEL)' \
 	    -cf "$$ARCHIVE" \
 	    output/run_* $$(ls logs/sim-*.log logs/sim_*.log 2>/dev/null); \
