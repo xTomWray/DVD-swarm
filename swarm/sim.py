@@ -116,6 +116,22 @@ def _parse_args() -> argparse.Namespace:
              "script. Raise if autopilot-flight legitimately needs longer "
              "to upload + run + verify the mission at scale (default: 300).",
     )
+    run_p.add_argument(
+        "--readiness-probe-timeout",
+        type=float,
+        default=5.0,
+        help="Per-probe TCP/Flask timeout (seconds) during the 6-phase swarm "
+             "readiness check. Default 5s handles cold-boot at N=50; raise to "
+             "10s+ if probes fail under heavier host load (default: 5).",
+    )
+    run_p.add_argument(
+        "--readiness-total-timeout",
+        type=float,
+        default=0.0,
+        help="Total wall-clock budget (seconds) for each readiness phase. "
+             "0 (default) auto-sizes as max(180, 60 × ceil(N/10)) — N=50 gets "
+             "300s, N=100 gets 600s. Override only for very slow hosts.",
+    )
 
     return parser.parse_args()
 
@@ -630,10 +646,15 @@ def main() -> int:
 
     try:
         # Phase 5: wait for all instances to report readiness.
+        readiness_total = (
+            args.readiness_total_timeout
+            if args.readiness_total_timeout > 0
+            else max(180.0, 60.0 * math.ceil(args.size / 10))
+        )
         ready_drones = _wait_for_swarm_ready(
             args.size,
-            per_instance_timeout=2.0,
-            total_timeout=max(120.0, 30.0 * math.ceil(args.size / 10)),
+            per_instance_timeout=args.readiness_probe_timeout,
+            total_timeout=readiness_total,
             allow_partial=not args.strict,
         )
         if not ready_drones:
