@@ -43,12 +43,13 @@ help:
 	@echo "      Run RUNS benign-only captures (no attack, label=null on every row)."
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
-	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel host-side Stages workers"
+	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
 	@echo "    STAGE1_CONCURRENCY=16       (default 16) — lower to 8 if docker exec contention at N=100+"
-	@echo "    INACTIVITY_TIMEOUT=120      (default 60) — FC-silence cap for all Stages waits"
+	@echo "    MISSION_REQUEST_TIMEOUT=60  (default 30) — bump if uploads time out under host load"
+	@echo "    MISSION_ACK_TIMEOUT=60      (default 30) — bump if MISSION_ACK is missing post-upload"
 	@echo "    MISSION_UPLOAD_RETRIES=5    (default 3)  — bump if all retries exhausted"
-	@echo "    READINESS_PROBE_TIMEOUT=10  (default 5)  — bump if 0 drones reach HEARTBEAT at large N"
-	@echo "    READINESS_TOTAL_TIMEOUT=600 (default 0 = auto: max(180, 60×ceil(N/10)))"
+	@echo "    STAGE_HTTP_TIMEOUT=900      (default 600)— upper bound for one stage script per drone"
+	@echo "    STAGE1_SETTLE=30            (default 0 = auto: max(15, N/3))"
 	@echo ""
 	@echo "  make follow"
 	@echo "      tail -f the most-recent logs/*.log file."
@@ -152,20 +153,22 @@ END                      ?= 1200
 ATTACK                   ?= attitude-spoof
 GCS_CONCURRENCY          ?= 12
 STAGE1_CONCURRENCY       ?= 16
-INACTIVITY_TIMEOUT       ?= 60
+MISSION_REQUEST_TIMEOUT  ?= 30
+MISSION_ACK_TIMEOUT      ?= 30
 MISSION_UPLOAD_RETRIES   ?= 3
-READINESS_PROBE_TIMEOUT  ?= 5
-READINESS_TOTAL_TIMEOUT  ?= 0
+STAGE_HTTP_TIMEOUT       ?= 600
+STAGE1_SETTLE            ?= 0
 
 # Common knob bundle passed to every swarm.sim invocation. Avoids the
 # four sim* recipes drifting from each other when a new knob is added.
 _SIM_FLAGS = \
     --gcs-concurrency $(GCS_CONCURRENCY) \
     --stage1-concurrency $(STAGE1_CONCURRENCY) \
-    --inactivity-timeout $(INACTIVITY_TIMEOUT) \
+    --mission-request-timeout $(MISSION_REQUEST_TIMEOUT) \
+    --mission-ack-timeout $(MISSION_ACK_TIMEOUT) \
     --mission-upload-retries $(MISSION_UPLOAD_RETRIES) \
-    --readiness-probe-timeout $(READINESS_PROBE_TIMEOUT) \
-    --readiness-total-timeout $(READINESS_TOTAL_TIMEOUT)
+    --stage-http-timeout $(STAGE_HTTP_TIMEOUT) \
+    --stage1-settle $(STAGE1_SETTLE)
 
 # Every sim* recipe tees its output to a UTC-timestamped file under
 # <project_root>/logs/ via this snippet:

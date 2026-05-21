@@ -104,52 +104,61 @@ def _parse_args() -> argparse.Namespace:
         "--gcs-concurrency",
         type=int,
         default=12,
-        help="Max parallel Stages workers driving the GUIDED → arm → takeoff → "
-             "AUTO sequence over MAVLink. Lower if you see widespread mission "
-             "upload retries under host load (default: 12).",
-    )
-    run_p.add_argument(
-        "--inactivity-timeout",
-        type=float,
-        default=60.0,
-        help="FC silence threshold (seconds) for all Stages wait helpers. "
-             "Each wait keeps going as long as the FC sends ANY MAVLink "
-             "message; only bails after this many seconds of total silence. "
-             "Replaces the per-stage wall-clock timeouts (default: 60).",
-    )
-    run_p.add_argument(
-        "--mission-upload-retries",
-        type=int,
-        default=3,
-        help="Number of times to re-attempt a full mission upload if the "
-             "FC goes silent or rejects the mission. Each retry clears the "
-             "FC's partial mission first (default: 3 retries = up to 4 attempts).",
+        help="Max parallel POST /stage2 and /stage3 invocations. Each POST "
+             "blocks until the GCS container's stage script returns (arm + "
+             "takeoff or mission upload + AUTO), so this caps how many drones "
+             "the simulator-mgmt services are servicing at once. Lower if "
+             "host load is high (default: 12).",
     )
     run_p.add_argument(
         "--stage1-concurrency",
         type=int,
         default=16,
         help="Max parallel POST /stage1 invocations to simulator-lite containers "
-             "(boots arducopter inside each FC container). Was serial before — at "
-             "N=50 serial × 60s timeout = ~50 min wallclock, exhausting the "
-             "HEARTBEAT budget. Default 16 keeps the whole Stage 1 phase under ~3 "
-             "min at N=50 (default: 16).",
+             "(boots arducopter inside each FC container). Default 16 keeps the "
+             "whole Stage 1 phase under ~3 min at N=50 (default: 16).",
     )
     run_p.add_argument(
-        "--readiness-probe-timeout",
+        "--mission-request-timeout",
         type=float,
-        default=5.0,
-        help="Per-probe TCP/Flask timeout (seconds) during the 6-phase swarm "
-             "readiness check. Default 5s handles cold-boot at N=50; raise to "
-             "10s+ if probes fail under heavier host load (default: 5).",
+        default=30.0,
+        help="Seconds the in-container autopilot-flight.py waits for each "
+             "MISSION_REQUEST before considering the upload stalled. Upstream "
+             "DVD hard-codes 5s, which drops random uploads at N>=10 under CPU "
+             "caps. Passed via env to the GCS container (default: 30).",
     )
     run_p.add_argument(
-        "--readiness-total-timeout",
+        "--mission-ack-timeout",
+        type=float,
+        default=30.0,
+        help="Seconds the in-container autopilot-flight.py waits for the "
+             "terminal MISSION_ACK after all waypoints are sent (default: 30).",
+    )
+    run_p.add_argument(
+        "--mission-upload-retries",
+        type=int,
+        default=3,
+        help="Number of times the in-container autopilot-flight.py re-attempts "
+             "a full mission upload on failure. Each retry clears the FC's "
+             "partial mission first (default: 3 retries = up to 4 attempts).",
+    )
+    run_p.add_argument(
+        "--stage-http-timeout",
+        type=float,
+        default=600.0,
+        help="HTTP read timeout (seconds) for each /stage2 and /stage3 POST. "
+             "The POST blocks until the GCS-container script returns; this is "
+             "the upper bound for a single drone's arm+takeoff or mission "
+             "upload (default: 600).",
+    )
+    run_p.add_argument(
+        "--stage1-settle",
         type=float,
         default=0.0,
-        help="Total wall-clock budget (seconds) for each readiness phase. "
-             "0 (default) auto-sizes as max(180, 60 × ceil(N/10)) — N=50 gets "
-             "300s, N=100 gets 600s. Override only for very slow hosts.",
+        help="Seconds to wait after the /stage1 fan-out completes before "
+             "POSTing /stage2 — gives FCs time to bind /dev/ttyUSB0 and "
+             "routers time to forward HEARTBEATs. 0 (default) auto-sizes to "
+             "max(15, N/3).",
     )
 
     return parser.parse_args()
@@ -353,32 +362,60 @@ def _trigger_stage1(n: int) -> None:
     log.info("Stage 1 (SITL) triggered for drone %d.", n)
 
 
-def _probe_mavlink_heartbeat(n: int, timeout: float) -> bool:
-    """Return True when a HEARTBEAT arrives via TCP 5760 from inside GCS.
+def _post_stage(n: int, stage: int, timeout: float) -> None:
+    """POST /stage<stage> to simulator-lite for drone *n* and block until it
+    returns. The mgmt API execs the per-stage GCS script inside the container
+    with ``stream=False`` so the HTTP response signals completion.
 
-    This confirms the full FC → router → GCS chain is live, which TCP-accept
-    alone does not. Uses the same library and connection string as
-    ``arm-and-takeoff.py`` so a pass here guarantees its ``wait_heartbeat``
-    will succeed.
+    Raises:
+        RuntimeError: When the POST does not return HTTP 200.
     """
-    script = (
-        "from pymavlink import mavutil; import sys; "
-        f"m = mavutil.mavlink_connection('tcp:10.13.{n}.3:5760'); "
-        f"hb = m.wait_heartbeat(timeout={timeout}); "
-        "sys.exit(0 if hb is not None else 1)"
-    )
+    import requests
+
+    url = f"http://localhost:{8000 + n}/stage{stage}"
     try:
-        result = subprocess.run(
-            [
-                "docker", "exec", f"ground-control-station-lite-{n}",
-                "python3", "-c", script,
-            ],
-            capture_output=True,
-            timeout=timeout + 5,
+        resp = requests.post(url, timeout=timeout)
+    except Exception as exc:
+        raise RuntimeError(f"drone {n}: POST {url} failed: {exc}") from exc
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"drone {n}: POST {url} returned {resp.status_code}: {resp.text[:200]}"
         )
-        return result.returncode == 0
-    except Exception:
-        return False
+
+
+def _parallel_post(
+    ids: "list[int] | set[int]",
+    stage: int,
+    *,
+    max_workers: int,
+    timeout: float,
+) -> set[int]:
+    """POST /stage<stage> to every id in parallel; return the set that succeeded.
+
+    Logs each failure but does not raise — the caller decides what to do with
+    the survivor set (continue with partial swarm, or abort if empty).
+    """
+    targets = sorted(set(ids))
+    if not targets:
+        return set()
+    workers = max(1, min(len(targets), max_workers))
+    log.info(
+        "POST /stage%d to %d drone(s) (concurrency=%d, http_timeout=%.0fs)…",
+        stage, len(targets), workers, timeout,
+    )
+    ok: set[int] = set()
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_post_stage, n, stage, timeout): n for n in targets}
+        for fut in as_completed(futures):
+            n = futures[fut]
+            try:
+                fut.result()
+                ok.add(n)
+                log.info("Drone %d: stage=%d ok", n, stage)
+            except Exception as exc:
+                log.warning("Drone %d: stage=%d failed: %s", n, stage, exc)
+    log.info("Stage %d complete: %d/%d ok", stage, len(ok), len(targets))
+    return ok
 
 
 def _poll_until_ready(
@@ -448,7 +485,7 @@ def _wait_for_swarm_ready(
     allow_partial: bool = False,
     stage1_concurrency: int = 16,
 ) -> set[int]:
-    """Bring the swarm to a state where GCS stages can run.
+    """Bring the swarm to a state where /stage2 (arm + takeoff) can be POSTed.
 
     Sequential phases:
     1. Wait for companion Flask (``/socket-health`` → 200).
@@ -456,12 +493,14 @@ def _wait_for_swarm_ready(
     3. Trigger ``mavlink-routerd`` (POST companion ``/telemetry/start-telemetry``).
     4. Wait for TCP 5760 on the companion to accept connections.
     5. Trigger Stage 1 (POST simulator-lite ``/stage1``) to boot SITL.
-    6. Wait for an actual HEARTBEAT to arrive over TCP 5760.
 
-    With ``allow_partial=True``, drones that fail any phase are dropped from
-    later phases and from the returned ready set — the run continues with
-    whichever drones reached HEARTBEAT successfully. Useful at large N
-    where 5–10% transient failures are common.
+    The HEARTBEAT readiness probe that used to live as phase 6 has been
+    removed: at N=50 it required N parallel ``docker exec`` calls per poll
+    round (~300 ms each), saturating the docker daemon long before any
+    HEARTBEAT could arrive. The caller now sleeps a fixed settle interval
+    after this function returns; ``arm-and-takeoff.py`` (POST /stage2) does
+    its own ``wait_heartbeat()`` loop with 5 retries × 30 s, which is the
+    canonical "is SITL up?" check anyway.
 
     Args:
         size: Number of drone instances.
@@ -470,7 +509,7 @@ def _wait_for_swarm_ready(
         allow_partial: Skip failed drones instead of raising.
 
     Returns:
-        Set of drone IDs that completed all six phases.
+        Set of drone IDs that completed all five phases (stage1 POST returned 200).
     """
     all_drones = set(range(1, size + 1))
 
@@ -515,59 +554,7 @@ def _wait_for_swarm_ready(
                 else:
                     raise
 
-    # SITL needs ~5–15s to start emitting heartbeats. Use a longer per-probe
-    # timeout here so each attempt actually has time to receive one.
-    ready = _poll_until_ready(
-        _probe_mavlink_heartbeat, staged, "MAVLink HEARTBEAT",
-        10.0, total_timeout, allow_partial=allow_partial,
-    )
-
-    return ready
-
-
-# ---------------------------------------------------------------------------
-# GCS flight stage execution
-# ---------------------------------------------------------------------------
-
-
-_WAYPOINT_FILE = (
-    Path(__file__).resolve().parent.parent
-    / "ground-control-station" / "missions" / "waypoints_custom_zigzag_square.txt"
-)
-
-
-def _drive_stages(
-    n: int,
-    waypoint_file: Path,
-    inactivity_timeout: float,
-    mission_upload_retries: int,
-) -> None:
-    """Drive drone *n* from BOOT → AUTO via a host-side MAVLink session.
-
-    Replaces the legacy ``docker exec arm-and-takeoff && docker exec
-    autopilot-flight`` chain with a single ``Stages`` instance — one
-    pymavlink connection per drone, FC-liveness-based waits (not wall
-    clock), and retryable mission upload.
-
-    Args:
-        n: Drone instance number (1-based).
-        waypoint_file: Path to the host-side waypoints text file.
-        inactivity_timeout: FC-silence threshold for every wait helper.
-        mission_upload_retries: Number of upload re-attempts on failure.
-    """
-    from swarm.stages import StageConfig, Stages
-
-    cfg = StageConfig(
-        instance=n,
-        waypoint_file=waypoint_file,
-        inactivity_timeout=inactivity_timeout,
-        mission_upload_retries=mission_upload_retries,
-    )
-    stages = Stages(cfg)
-    try:
-        stages.run_to_auto()
-    finally:
-        stages.reset()
+    return staged
 
 
 # ---------------------------------------------------------------------------
@@ -653,16 +640,34 @@ def main() -> int:
         "--out", "docker-compose.swarm.yml",
         "--raw-dir", str(raw_dir),
     ])
+
+    # Propagate the in-container autopilot-flight.py knobs into docker
+    # compose's environment so the ${VAR:-default} pass-through in the
+    # generated compose file picks them up. This is the only point at
+    # which sim.py's CLI flags reach the GCS containers.
+    import os
+    compose_env = os.environ.copy()
+    compose_env["MISSION_REQUEST_TIMEOUT"] = str(int(args.mission_request_timeout))
+    compose_env["MISSION_ACK_TIMEOUT"] = str(int(args.mission_ack_timeout))
+    compose_env["MISSION_UPLOAD_RETRIES"] = str(args.mission_upload_retries)
+    log.info(
+        "GCS env: MISSION_REQUEST_TIMEOUT=%s MISSION_ACK_TIMEOUT=%s MISSION_UPLOAD_RETRIES=%s",
+        compose_env["MISSION_REQUEST_TIMEOUT"],
+        compose_env["MISSION_ACK_TIMEOUT"],
+        compose_env["MISSION_UPLOAD_RETRIES"],
+    )
     _run([
         "docker", "compose",
         "--progress", "plain",
         "-p", "dvd-swarm",
         "-f", "docker-compose.swarm.yml",
         "up", "-d",
-    ])
+    ], env=compose_env)
 
     # -----------------------------------------------------------------
-    # Variables that must be accessible in the finally block.
+    # Variables that must be accessible in the finally block. ALL are
+    # initialised here (not inside the try) so the finally never raises
+    # UnboundLocalError when an early-phase exception jumps over them.
     # -----------------------------------------------------------------
     sniffer: object | None = None
     writer: PacketWriter | None = None
@@ -670,23 +675,24 @@ def main() -> int:
     target_ids: list[int] = []
     drone_ids: list[int] = list(range(1, args.size + 1))  # default for cleanup paths
     skipped: list[int] = []
+    windows: list[AttackWindow] = []
 
     try:
-        # Phase 5: wait for all instances to report readiness.
-        readiness_total = (
-            args.readiness_total_timeout
-            if args.readiness_total_timeout > 0
-            else max(180.0, 60.0 * math.ceil(args.size / 10))
-        )
+        # Phase 5: wait for all instances to report stage1-readiness
+        # (companion + sim Flask up, router started, TCP 5760 accepting,
+        # /stage1 POST returned 200). NOTE: stage1 returns immediately
+        # server-side (detached SITL boot), so a returned ready set is
+        # NOT yet a guarantee SITL is emitting HEARTBEATs.
+        readiness_total = max(180.0, 60.0 * math.ceil(args.size / 10))
         ready_drones = _wait_for_swarm_ready(
             args.size,
-            per_instance_timeout=args.readiness_probe_timeout,
+            per_instance_timeout=5.0,
             total_timeout=readiness_total,
             allow_partial=not args.strict,
             stage1_concurrency=args.stage1_concurrency,
         )
         if not ready_drones:
-            raise RuntimeError("No drones reached HEARTBEAT readiness — aborting.")
+            raise RuntimeError("No drones reached stage1 readiness — aborting.")
         skipped = sorted(set(range(1, args.size + 1)) - ready_drones)
         if skipped:
             log.warning(
@@ -695,7 +701,19 @@ def main() -> int:
             )
         drone_ids = sorted(ready_drones)
 
-        # Phase 6: set up label windows and start sniffer.
+        # Phase 5b: settle. Fixed sleep replaces the failed docker-exec
+        # HEARTBEAT probe — arm-and-takeoff.py's own wait_heartbeat() loop
+        # (5 retries × 30s) handles any drones that boot slowly inside this
+        # window, so we don't need to detect HEARTBEAT here.
+        settle = args.stage1_settle if args.stage1_settle > 0 else max(15.0, len(drone_ids) / 3.0)
+        log.info(
+            "Letting %d drone(s) settle for %.0fs before POST /stage2…",
+            len(drone_ids), settle,
+        )
+        time.sleep(settle)
+
+        # Phase 6: set up label windows and start sniffer BEFORE the stage2/3
+        # POSTs so that MISSION_REQUEST/MISSION_ACK traffic is captured.
         capture_start_epoch = time.time()
         target_ids = (
             parse_targets(args.targets) if args.targets
@@ -708,7 +726,7 @@ def main() -> int:
         # attack_type='null'. Attack runs install one window covering
         # [start, end] for the targeted drones.
         if args.attack == "none":
-            windows: list[AttackWindow] = []
+            windows = []
         else:
             windows = [
                 AttackWindow(
@@ -728,34 +746,26 @@ def main() -> int:
         sniffer = start_sniffer(drone_ids, writer)
         log.info("Capture started (epoch %.3f).", capture_start_epoch)
 
-        # Phase 7: drive each ready drone GUIDED → arm → takeoff → AUTO from
-        # the host over MAVLink. One pymavlink session per drone; the per-
-        # drone router at tcp:10.13.<n>.3:5760 multiplexes us alongside the
-        # sniffer. Concurrency caps the simultaneous sessions — too many
-        # active uploads share host I/O and slow MISSION_REQUEST round-trips.
-        gcs_workers = max(1, min(len(drone_ids), args.gcs_concurrency))
-        log.info(
-            "Driving %d drone(s) to AUTO (concurrency=%d, inactivity_timeout=%.0fs, retries=%d)…",
-            len(drone_ids), gcs_workers,
-            args.inactivity_timeout, args.mission_upload_retries,
+        # Phase 7a: POST /stage2 (arm-and-takeoff) to every ready drone.
+        # Each POST execs ground-control-station/stages/arm-and-takeoff.py
+        # inside the GCS container and blocks until the script returns.
+        # No host-side MAVLink — all per-drone work happens inside docker.
+        armed = _parallel_post(
+            drone_ids, stage=2,
+            max_workers=args.gcs_concurrency,
+            timeout=args.stage_http_timeout,
         )
-        with ThreadPoolExecutor(max_workers=gcs_workers) as pool:
-            futures_arm = {
-                pool.submit(
-                    _drive_stages,
-                    n,
-                    _WAYPOINT_FILE,
-                    args.inactivity_timeout,
-                    args.mission_upload_retries,
-                ): n
-                for n in drone_ids
-            }
-            for fut in as_completed(futures_arm):
-                n = futures_arm[fut]
-                try:
-                    fut.result()
-                except Exception as exc:
-                    log.warning("Drone %d Stages error: %s", n, exc)
+
+        # Phase 7b: POST /stage3 (mission upload + AUTO) to drones that
+        # survived stage2. Uses the bind-mounted patched autopilot-flight.py
+        # whose MISSION_REQUEST timeout / retry loop / ACK timeout are
+        # configurable via env (set above for `docker compose up`).
+        auto = _parallel_post(
+            sorted(armed), stage=3,
+            max_workers=args.gcs_concurrency,
+            timeout=args.stage_http_timeout,
+        )
+        log.info("Drones at AUTO: %d/%d", len(auto), len(drone_ids))
 
         if args.attack == "none":
             # Benign-only: no spoofing threads, just capture for the mission

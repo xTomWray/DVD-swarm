@@ -279,6 +279,12 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
     logs_path = str((raw_dir / f"instance-{n}").resolve())
     _stages = str(_REPO_ROOT / "ground-control-station/stages")
     _missions = str(_REPO_ROOT / "ground-control-station/missions")
+    # Patched autopilot-flight.py overlays the upstream copy at runtime.
+    # Reads MISSION_REQUEST_TIMEOUT, MISSION_ACK_TIMEOUT, MISSION_UPLOAD_RETRIES
+    # from env so the hard-coded 5s MISSION_REQUEST timeout in DVD's upstream
+    # script — the dominant N>=10 failure mode — becomes runtime-tunable
+    # without modifying ground-control-station/ source.
+    _autopilot_patch = str(_REPO_ROOT / "swarm/gcs_patches/autopilot-flight.py")
     return {
         "image": IMAGES["ground-control-station"],
         "container_name": f"ground-control-station-lite-{n}",
@@ -290,6 +296,12 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
             "QT_NO_MITSHM=1",
             "XDG_RUNTIME_DIR=/tmp",
             f"SWARM_INSTANCE={n}",  # stage scripts use this to derive companion TCP IP
+            # Runtime knobs for the patched autopilot-flight.py overlay below.
+            # Pass-through from `docker compose` env so `make sim MISSION_*=…`
+            # propagates without regenerating the compose file.
+            f"MISSION_REQUEST_TIMEOUT=${{MISSION_REQUEST_TIMEOUT:-30}}",
+            f"MISSION_ACK_TIMEOUT=${{MISSION_ACK_TIMEOUT:-30}}",
+            f"MISSION_UPLOAD_RETRIES=${{MISSION_UPLOAD_RETRIES:-3}}",
         ],
         "volumes": [
             # Qt requires /etc/machine-id — available on any Linux host
@@ -300,6 +312,12 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
             f"{_stages}:/opt/gcs/stages:ro",
             # Patch missions (adds zigzag waypoints at 10m / ~55m spacing)
             f"{_missions}:/opt/gcs/missions:ro",
+            # Single-file overlay of our patched autopilot-flight.py on top of
+            # the directory mount above. Docker honours single-file binds over
+            # directory binds when listed last, so /opt/gcs/stages/* still
+            # comes from ground-control-station/stages EXCEPT autopilot-flight.py
+            # which comes from swarm/gcs_patches/.
+            f"{_autopilot_patch}:/opt/gcs/stages/autopilot-flight.py:ro",
         ],
         "networks": {
             f"dvd-net-{n}": {"ipv4_address": GCS_IP_TEMPLATE.format(n=n)},
