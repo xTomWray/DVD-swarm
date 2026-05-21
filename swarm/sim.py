@@ -104,17 +104,25 @@ def _parse_args() -> argparse.Namespace:
         "--gcs-concurrency",
         type=int,
         default=12,
-        help="Max parallel docker-exec invocations for the GCS arm + autopilot "
-             "stages. Lower if you see widespread autopilot-flight.py exit 1 "
-             "warnings under host load (default: 12).",
+        help="Max parallel Stages workers driving the GUIDED → arm → takeoff → "
+             "AUTO sequence over MAVLink. Lower if you see widespread mission "
+             "upload retries under host load (default: 12).",
     )
     run_p.add_argument(
-        "--gcs-stage-timeout",
+        "--mission-request-timeout",
         type=float,
-        default=300.0,
-        help="Per-stage subprocess timeout (seconds) for each GCS Python "
-             "script. Raise if autopilot-flight legitimately needs longer "
-             "to upload + run + verify the mission at scale (default: 300).",
+        default=30.0,
+        help="Per-MISSION_REQUEST timeout (seconds) during mission upload. "
+             "The legacy autopilot-flight.py hard-coded 5s, which dropped "
+             "uploads at N≥10 under CPU caps. 30s is safe at N=50 (default: 30).",
+    )
+    run_p.add_argument(
+        "--mission-upload-retries",
+        type=int,
+        default=2,
+        help="Number of times to re-attempt a full mission upload if a "
+             "MISSION_REQUEST or MISSION_ACK times out. Each retry clears the "
+             "FC's partial mission first (default: 2 retries = up to 3 attempts).",
     )
     run_p.add_argument(
         "--stage1-concurrency",
@@ -521,42 +529,49 @@ def _wait_for_swarm_ready(
 # ---------------------------------------------------------------------------
 
 
-def _arm_and_autopilot(n: int, log_dir: Path, stage_timeout: float = 300.0) -> None:
-    """Execute arm-and-takeoff then autopilot-flight GCS stages for drone *n*.
+_WAYPOINT_FILE = (
+    Path(__file__).resolve().parent.parent
+    / "ground-control-station" / "missions" / "waypoints_custom_zigzag_square.txt"
+)
+
+
+def _drive_stages(
+    n: int,
+    waypoint_file: Path,
+    mission_request_timeout: float,
+    mission_upload_retries: int,
+) -> None:
+    """Drive drone *n* from BOOT → AUTO via a host-side MAVLink session.
+
+    Replaces the legacy ``docker exec arm-and-takeoff && docker exec
+    autopilot-flight`` chain with a single ``Stages`` instance — one
+    pymavlink connection per drone, host-side timeouts, and retryable
+    mission upload (the hard-coded 5s MISSION_REQUEST timeout in the
+    legacy ``autopilot-flight.py`` was the root cause of N≥10 dropouts).
 
     Args:
         n: Drone instance number (1-based).
-        log_dir: Directory where GCS stage stdout/stderr is written.
-        stage_timeout: Per-stage subprocess timeout in seconds.
+        waypoint_file: Path to the host-side waypoints text file.
+        mission_request_timeout: Per-MISSION_REQUEST timeout in seconds.
+        mission_upload_retries: Number of upload re-attempts on failure.
 
     Raises:
-        subprocess.CalledProcessError: When either stage exits non-zero.
+        Exception: Propagates any unrecoverable stage failure (caught by
+            the orchestrator and logged per-drone).
     """
-    container = f"ground-control-station-lite-{n}"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "gcs-stage.log"
+    from swarm.stages import StageConfig, Stages
 
-    with open(log_path, "ab") as lf:
-        for stage in ("arm-and-takeoff.py", "autopilot-flight.py"):
-            try:
-                result = subprocess.run(
-                    ["docker", "exec", container, "python3", f"/opt/gcs/stages/{stage}"],
-                    capture_output=True,
-                    timeout=stage_timeout,
-                )
-            except subprocess.TimeoutExpired as exc:
-                lf.write(f"=== {stage} TIMEOUT after {stage_timeout:.0f}s ===\n".encode())
-                if exc.stdout:
-                    lf.write(exc.stdout)
-                if exc.stderr:
-                    lf.write(exc.stderr)
-                log.warning("Drone %d %s timed out after %.0fs", n, stage, stage_timeout)
-                continue
-            lf.write(f"=== {stage} exit={result.returncode} ===\n".encode())
-            lf.write(result.stdout)
-            lf.write(result.stderr)
-            if result.returncode != 0:
-                log.warning("Drone %d %s exited %d", n, stage, result.returncode)
+    cfg = StageConfig(
+        instance=n,
+        waypoint_file=waypoint_file,
+        mission_request_timeout=mission_request_timeout,
+        mission_upload_retries=mission_upload_retries,
+    )
+    stages = Stages(cfg)
+    try:
+        stages.run_to_auto()
+    finally:
+        stages.reset()
 
 
 # ---------------------------------------------------------------------------
@@ -717,22 +732,25 @@ def main() -> int:
         sniffer = start_sniffer(drone_ids, writer)
         log.info("Capture started (epoch %.3f).", capture_start_epoch)
 
-        # Phase 7: push ready drones through GCS flight stages in parallel.
-        # max_workers is intentionally lower than the readiness probes because
-        # the GCS stages drive sustained MAVLink I/O — too many concurrent
-        # autopilot-flight runs cause MAVLink ACK timeouts on a busy host.
+        # Phase 7: drive each ready drone GUIDED → arm → takeoff → AUTO from
+        # the host over MAVLink. One pymavlink session per drone; the per-
+        # drone router at tcp:10.13.<n>.3:5760 multiplexes us alongside the
+        # sniffer. Concurrency caps the simultaneous sessions — too many
+        # active uploads share host I/O and slow MISSION_REQUEST round-trips.
         gcs_workers = max(1, min(len(drone_ids), args.gcs_concurrency))
         log.info(
-            "Arming and launching %d drone(s) (concurrency=%d, stage timeout=%.0fs)…",
-            len(drone_ids), gcs_workers, args.gcs_stage_timeout,
+            "Driving %d drone(s) to AUTO (concurrency=%d, mission_request_timeout=%.0fs, retries=%d)…",
+            len(drone_ids), gcs_workers,
+            args.mission_request_timeout, args.mission_upload_retries,
         )
         with ThreadPoolExecutor(max_workers=gcs_workers) as pool:
             futures_arm = {
                 pool.submit(
-                    _arm_and_autopilot,
+                    _drive_stages,
                     n,
-                    output_dir / "logs" / f"instance-{n}",
-                    args.gcs_stage_timeout,
+                    _WAYPOINT_FILE,
+                    args.mission_request_timeout,
+                    args.mission_upload_retries,
                 ): n
                 for n in drone_ids
             }
@@ -741,7 +759,7 @@ def main() -> int:
                 try:
                     fut.result()
                 except Exception as exc:
-                    log.warning("Drone %d GCS stage error: %s", n, exc)
+                    log.warning("Drone %d Stages error: %s", n, exc)
 
         if args.attack == "none":
             # Benign-only: no spoofing threads, just capture for the mission

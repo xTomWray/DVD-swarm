@@ -43,10 +43,11 @@ help:
 	@echo "      Run RUNS benign-only captures (no attack, label=null on every row)."
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
-	@echo "    GCS_CONCURRENCY=8           (default 12) — lower if autopilot-flight exits 1 at high N"
+	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel host-side Stages workers"
 	@echo "    STAGE1_CONCURRENCY=16       (default 16) — lower to 8 if docker exec contention at N=100+"
-	@echo "    GCS_STAGE_TIMEOUT=300       (default 300) — bump for slower hosts"
-	@echo "    READINESS_PROBE_TIMEOUT=10  (default 5) — bump if 0 drones reach HEARTBEAT at large N"
+	@echo "    MISSION_REQUEST_TIMEOUT=60  (default 30) — bump if mission upload retries appear in logs"
+	@echo "    MISSION_UPLOAD_RETRIES=4    (default 2)  — bump if a single retry is not enough"
+	@echo "    READINESS_PROBE_TIMEOUT=10  (default 5)  — bump if 0 drones reach HEARTBEAT at large N"
 	@echo "    READINESS_TOTAL_TIMEOUT=600 (default 0 = auto: max(180, 60×ceil(N/10)))"
 	@echo ""
 	@echo "  make follow"
@@ -151,9 +152,20 @@ END                      ?= 1200
 ATTACK                   ?= attitude-spoof
 GCS_CONCURRENCY          ?= 12
 STAGE1_CONCURRENCY       ?= 16
-GCS_STAGE_TIMEOUT        ?= 300
+MISSION_REQUEST_TIMEOUT  ?= 30
+MISSION_UPLOAD_RETRIES   ?= 2
 READINESS_PROBE_TIMEOUT  ?= 5
 READINESS_TOTAL_TIMEOUT  ?= 0
+
+# Common knob bundle passed to every swarm.sim invocation. Avoids the
+# four sim* recipes drifting from each other when a new knob is added.
+_SIM_FLAGS = \
+    --gcs-concurrency $(GCS_CONCURRENCY) \
+    --stage1-concurrency $(STAGE1_CONCURRENCY) \
+    --mission-request-timeout $(MISSION_REQUEST_TIMEOUT) \
+    --mission-upload-retries $(MISSION_UPLOAD_RETRIES) \
+    --readiness-probe-timeout $(READINESS_PROBE_TIMEOUT) \
+    --readiness-total-timeout $(READINESS_TOTAL_TIMEOUT)
 
 # Every sim* recipe tees its output to a UTC-timestamped file under
 # <project_root>/logs/ via this snippet:
@@ -172,7 +184,7 @@ sim:
 	$(PYTHON) -u -m swarm.sim run \
 	    --size $(SIZE) --start $(START) --end $(END) \
 	    --attack $(ATTACK) \
-	    --gcs-concurrency $(GCS_CONCURRENCY) --gcs-stage-timeout $(GCS_STAGE_TIMEOUT) --readiness-probe-timeout $(READINESS_PROBE_TIMEOUT) --readiness-total-timeout $(READINESS_TOTAL_TIMEOUT) --stage1-concurrency $(STAGE1_CONCURRENCY) 2>&1 | tee "$$LOG"
+	    $(_SIM_FLAGS) 2>&1 | tee "$$LOG"
 
 # ── Multi-run loops ───────────────────────────────────────────────────────────
 # Knobs:
@@ -209,7 +221,7 @@ sim-multi:
 	    $(PYTHON) -u -m swarm.sim run \
 	        --size $(SIZE) --start $(START) --end $(END) \
 	        --attack $(ATTACK) \
-	        --gcs-concurrency $(GCS_CONCURRENCY) --gcs-stage-timeout $(GCS_STAGE_TIMEOUT) --readiness-probe-timeout $(READINESS_PROBE_TIMEOUT) --readiness-total-timeout $(READINESS_TOTAL_TIMEOUT) --stage1-concurrency $(STAGE1_CONCURRENCY) || exit 1; \
+	        $(_SIM_FLAGS) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"
 
@@ -235,7 +247,7 @@ sim-random:
 	    $(PYTHON) -u -m swarm.sim run \
 	        --size $(SIZE) --start $$S --end $$E \
 	        --attack $(ATTACK) \
-	        --gcs-concurrency $(GCS_CONCURRENCY) --gcs-stage-timeout $(GCS_STAGE_TIMEOUT) --readiness-probe-timeout $(READINESS_PROBE_TIMEOUT) --readiness-total-timeout $(READINESS_TOTAL_TIMEOUT) --stage1-concurrency $(STAGE1_CONCURRENCY) || exit 1; \
+	        $(_SIM_FLAGS) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"
 
@@ -342,6 +354,6 @@ sim-benign:
 	    $(PYTHON) -u -m swarm.sim run \
 	        --size $(SIZE) --start 0 --end $(END) \
 	        --attack none \
-	        --gcs-concurrency $(GCS_CONCURRENCY) --gcs-stage-timeout $(GCS_STAGE_TIMEOUT) --readiness-probe-timeout $(READINESS_PROBE_TIMEOUT) --readiness-total-timeout $(READINESS_TOTAL_TIMEOUT) --stage1-concurrency $(STAGE1_CONCURRENCY) || exit 1; \
+	        $(_SIM_FLAGS) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"
