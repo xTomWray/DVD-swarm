@@ -93,6 +93,13 @@ def _parse_args() -> argparse.Namespace:
         help="Do not tear down Docker compose after run.",
     )
     run_p.add_argument("--seed", type=int, default=None, help="RNG seed for mission generation.")
+    run_p.add_argument(
+        "--strict",
+        action="store_true",
+        help="Abort the run if any drone fails any readiness probe. Default is "
+             "to drop failed drones and continue with the rest — recommended "
+             "at large N where 5-10%% transient failures are common.",
+    )
 
     return parser.parse_args()
 
@@ -319,26 +326,35 @@ def _probe_mavlink_heartbeat(n: int, timeout: float) -> bool:
 
 def _poll_until_ready(
     probe: object,
-    size: int,
+    drone_ids: "set[int] | list[int]",
     label: str,
     per_timeout: float = 2.0,
     total_timeout: float = 120.0,
-) -> None:
-    """Poll *probe(n, per_timeout)* for all instances until all pass or timeout.
+    *,
+    allow_partial: bool = False,
+) -> set[int]:
+    """Poll *probe(n, per_timeout)* for the given drones until they all pass or timeout.
 
     Args:
         probe: Callable ``(n: int, timeout: float) -> bool``.
-        size: Number of drone instances (1-based).
+        drone_ids: Drone instance numbers to probe (a set or list).
         label: Human-readable name used in log messages.
         per_timeout: Timeout passed to each probe call.
         total_timeout: Maximum wall-clock seconds to wait overall.
+        allow_partial: When True, return the subset of drones that did pass
+            instead of raising ``TimeoutError`` on timeout.
+
+    Returns:
+        Set of drone IDs that passed the probe.
 
     Raises:
-        TimeoutError: When not all instances pass within *total_timeout*.
+        TimeoutError: When not all instances pass within *total_timeout* and
+            ``allow_partial`` is False.
     """
+    target = set(drone_ids)
+    pending = set(target)
     deadline = time.monotonic() + total_timeout
-    pending = set(range(1, size + 1))
-    log.info("Waiting for %s on %d drone(s) (budget %.0fs)…", label, size, total_timeout)
+    log.info("Waiting for %s on %d drone(s) (budget %.0fs)…", label, len(target), total_timeout)
 
     while pending and time.monotonic() < deadline:
         with ThreadPoolExecutor(max_workers=min(len(pending), 32)) as pool:
@@ -352,13 +368,28 @@ def _poll_until_ready(
         if pending:
             time.sleep(per_timeout)
 
+    ready = target - pending
     if pending:
-        raise TimeoutError(f"Timed out waiting for {label} on drone(s): {sorted(pending)}")
+        if allow_partial:
+            log.warning(
+                "Continuing without %s on %d drone(s): %s",
+                label, len(pending), sorted(pending),
+            )
+        else:
+            raise TimeoutError(f"Timed out waiting for {label} on drone(s): {sorted(pending)}")
+    else:
+        log.info("All %d drones: %s ✓", len(target), label)
 
-    log.info("All %d drones: %s ✓", size, label)
+    return ready
 
 
-def _wait_for_swarm_ready(size: int, per_instance_timeout: float, total_timeout: float) -> None:
+def _wait_for_swarm_ready(
+    size: int,
+    per_instance_timeout: float,
+    total_timeout: float,
+    *,
+    allow_partial: bool = False,
+) -> set[int]:
     """Bring the swarm to a state where GCS stages can run.
 
     Sequential phases:
@@ -369,25 +400,66 @@ def _wait_for_swarm_ready(size: int, per_instance_timeout: float, total_timeout:
     5. Trigger Stage 1 (POST simulator-lite ``/stage1``) to boot SITL.
     6. Wait for an actual HEARTBEAT to arrive over TCP 5760.
 
+    With ``allow_partial=True``, drones that fail any phase are dropped from
+    later phases and from the returned ready set — the run continues with
+    whichever drones reached HEARTBEAT successfully. Useful at large N
+    where 5–10% transient failures are common.
+
     Args:
         size: Number of drone instances.
         per_instance_timeout: Per-probe timeout in seconds (TCP / Flask probes).
         total_timeout: Budget for each polled phase.
+        allow_partial: Skip failed drones instead of raising.
+
+    Returns:
+        Set of drone IDs that completed all six phases.
     """
-    _poll_until_ready(_probe_flask, size, "companion Flask", per_instance_timeout, total_timeout)
-    _poll_until_ready(_probe_simulator_mgmt, size, "simulator mgmt Flask", per_instance_timeout, total_timeout)
+    all_drones = set(range(1, size + 1))
 
-    for n in range(1, size + 1):
-        _start_mavlink_router(n)
+    ready = _poll_until_ready(
+        _probe_flask, all_drones, "companion Flask",
+        per_instance_timeout, total_timeout, allow_partial=allow_partial,
+    )
+    ready = _poll_until_ready(
+        _probe_simulator_mgmt, ready, "simulator mgmt Flask",
+        per_instance_timeout, total_timeout, allow_partial=allow_partial,
+    )
 
-    _poll_until_ready(_probe_mavlink_tcp, size, "MAVLink TCP 5760", per_instance_timeout, total_timeout)
+    routed: set[int] = set()
+    for n in sorted(ready):
+        try:
+            _start_mavlink_router(n)
+            routed.add(n)
+        except Exception as exc:
+            if allow_partial:
+                log.warning("Drone %d: failed to start mavlink-routerd: %s", n, exc)
+            else:
+                raise
 
-    for n in range(1, size + 1):
-        _trigger_stage1(n)
+    ready = _poll_until_ready(
+        _probe_mavlink_tcp, routed, "MAVLink TCP 5760",
+        per_instance_timeout, total_timeout, allow_partial=allow_partial,
+    )
+
+    staged: set[int] = set()
+    for n in sorted(ready):
+        try:
+            _trigger_stage1(n)
+            staged.add(n)
+        except Exception as exc:
+            if allow_partial:
+                log.warning("Drone %d: failed to trigger stage1: %s", n, exc)
+            else:
+                raise
 
     # SITL needs ~5–15s to start emitting heartbeats. Use a longer per-probe
     # timeout here so each attempt actually has time to receive one.
-    _poll_until_ready(_probe_mavlink_heartbeat, size, "MAVLink HEARTBEAT", 10.0, total_timeout)
+    ready = _poll_until_ready(
+        _probe_mavlink_heartbeat, staged, "MAVLink HEARTBEAT",
+        10.0, total_timeout, allow_partial=allow_partial,
+    )
+
+    return ready
 
 
 # ---------------------------------------------------------------------------
@@ -519,21 +591,35 @@ def main() -> int:
     writer: PacketWriter | None = None
     capture_start_epoch: float = 0.0
     target_ids: list[int] = []
+    drone_ids: list[int] = list(range(1, args.size + 1))  # default for cleanup paths
+    skipped: list[int] = []
 
     try:
         # Phase 5: wait for all instances to report readiness.
-        _wait_for_swarm_ready(
+        ready_drones = _wait_for_swarm_ready(
             args.size,
             per_instance_timeout=2.0,
             total_timeout=max(120.0, 30.0 * math.ceil(args.size / 10)),
+            allow_partial=not args.strict,
         )
+        if not ready_drones:
+            raise RuntimeError("No drones reached HEARTBEAT readiness — aborting.")
+        skipped = sorted(set(range(1, args.size + 1)) - ready_drones)
+        if skipped:
+            log.warning(
+                "Proceeding with %d/%d drone(s); skipping %s",
+                len(ready_drones), args.size, skipped,
+            )
+        drone_ids = sorted(ready_drones)
 
         # Phase 6: set up label windows and start sniffer.
         capture_start_epoch = time.time()
         target_ids = (
             parse_targets(args.targets) if args.targets
-            else list(range(1, args.size + 1))
+            else drone_ids
         )
+        # Don't attempt to attack drones that never came up.
+        target_ids = sorted(set(target_ids) & ready_drones)
 
         # Benign-only runs use an empty window list — every row gets
         # attack_type='null'. Attack runs install one window covering
@@ -550,7 +636,6 @@ def main() -> int:
                 )
             ]
         labels = LabelLookup(windows)
-        drone_ids = list(range(1, args.size + 1))
         writer = PacketWriter(
             output_dir / "csv",
             labels,
@@ -560,16 +645,16 @@ def main() -> int:
         sniffer = start_sniffer(drone_ids, writer)
         log.info("Capture started (epoch %.3f).", capture_start_epoch)
 
-        # Phase 7: push all drones through GCS flight stages in parallel.
-        log.info("Arming and launching %d drone(s)…", args.size)
-        with ThreadPoolExecutor(max_workers=min(args.size, 32)) as pool:
+        # Phase 7: push ready drones through GCS flight stages in parallel.
+        log.info("Arming and launching %d drone(s)…", len(drone_ids))
+        with ThreadPoolExecutor(max_workers=min(len(drone_ids), 32)) as pool:
             futures_arm = {
                 pool.submit(
                     _arm_and_autopilot,
                     n,
                     output_dir / "logs" / f"instance-{n}",
                 ): n
-                for n in range(1, args.size + 1)
+                for n in drone_ids
             }
             for fut in as_completed(futures_arm):
                 n = futures_arm[fut]
@@ -629,7 +714,9 @@ def main() -> int:
 
         # Phase 12: collect ArduPilot flight-controller logs.
         # Source is per-run raw_dir (output_dir/raw/instance-N) so we don't
-        # have to clean a shared configs/data/raw between runs.
+        # have to clean a shared configs/data/raw between runs. We try every
+        # drone slot (not just `drone_ids`) so partial-readiness skips still
+        # collect whatever logs the failed drones did manage to write.
         for n in range(1, args.size + 1):
             src = raw_dir / f"instance-{n}"
             dst = output_dir / "logs" / f"instance-{n}"
@@ -654,6 +741,8 @@ def main() -> int:
         metadata = {
             "run_started_utc": datetime.now(UTC).isoformat(),
             "swarm_size": args.size,
+            "ready_drones": drone_ids,
+            "skipped_drones": skipped,
             "start_s": args.start,
             "end_s": args.end,
             "attack": args.attack,
