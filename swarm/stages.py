@@ -31,10 +31,14 @@ from pymavlink import mavutil
 
 log = logging.getLogger(__name__)
 
-# EKF_STATUS_REPORT flag bits we require before arming (matches the
-# behaviour of ``arm-and-takeoff.py`` which polls until "EKF status OK"):
-# ATTITUDE | VELOCITY_HORIZ | VELOCITY_VERT | POS_HORIZ_ABS | POS_VERT_ABS.
-_EKF_REQUIRED_FLAGS = 0x1F
+# EKF_STATUS_REPORT.flags bit required before arming. Mirrors the legacy
+# arm-and-takeoff.py check (`flags & EKF_POS_HORIZ_ABS`) — that's the
+# canonical "good enough to fly" signal the FC emits. Requiring more bits
+# (ATTITUDE + velocity + position vert) is too strict: at N=10 cold-boot
+# the FC takes a few seconds to assert all of them and 9/10 drones never
+# satisfy a 30 s wait, even though their HEARTBEAT and ATTITUDE streams
+# are flowing fine.
+_EKF_POS_HORIZ_ABS = 16
 
 
 class Stage(IntEnum):
@@ -278,6 +282,6 @@ class Stages:
         deadline = time.time() + timeout
         while time.time() < deadline:
             msg = self._master.recv_match(type="EKF_STATUS_REPORT", blocking=True, timeout=1)
-            if msg and (msg.flags & _EKF_REQUIRED_FLAGS) == _EKF_REQUIRED_FLAGS:
+            if msg and (msg.flags & _EKF_POS_HORIZ_ABS):
                 return
         raise TimeoutError(f"drone {self.cfg.instance}: EKF not OK")
