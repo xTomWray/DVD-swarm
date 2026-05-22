@@ -616,7 +616,8 @@ def main() -> int:
         duration_s=int(args.end),
         out_path=mission_host_path,
         seed=args.seed,
-        cruise_speed_m_s=3.0,  # conservative: generates ~67% more waypoints than needed
+        cruise_speed_m_s=10.0,  # sized for WPNAV_SPEED=2000; MIS_RESTART=1 loops if done early
+        leg_spacing_m=80.0,     # 160m legs let the drone reach 20 m/s before deceleration
     )
     # Snapshot mission into output dir.
     (output_dir / "mission.txt").write_bytes(mission_host_path.read_bytes())
