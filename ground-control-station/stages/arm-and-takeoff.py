@@ -63,6 +63,10 @@ _flight_params = {
     "LOIT_SPEED": 972.0,
     "WPNAV_SPEED_UP": 700.0,
     "WPNAV_SPEED_DN": 400.0,
+    # Loop the waypoint mission instead of loitering on completion — keeps
+    # drones maneuvering for the full capture window so attack/null rows
+    # both reflect active flight, not hover.
+    "MIS_RESTART": 1.0,
 }
 
 
