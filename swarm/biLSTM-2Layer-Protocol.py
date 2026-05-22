@@ -32,20 +32,45 @@ def focal_loss(alpha=0.25, gamma=2.0):
     return loss
 
 
-ABSOLUTE_TIME_COLS = [
-    'timestamp', 'time_boot_ms', 'time_usec',
-    'udp_time_relative', 'tcp_time_relative'
-]
-
+# Columns dropped before feature engineering. The downstream
+# engineer_features() filter is the final safety net — only columns
+# matching core_cols + a small whitelist survive — but dropping these
+# explicitly makes the preprocessing cheap and the intent obvious.
 DROP_COLS = [
-    'mav_packet_type', 'sim_uuid',
-    'ip_src', 'ip_addr', 'ip_src_host', 'ip_host', 'ip_dst', 'ip_dst_host',
-    'ip_checksum', 'ip_checksum_status',
+    # Identity / labels — not features
+    'mav_packet_type', 'sim_uuid', 'attack_type',
+
+    # Time columns — absolute and relative; carry no per-protocol signal
+    # for ATTITUDE/GPS/VFR_HUD attack detection. Drop wholesale.
+    'timestamp', 'frame_timestamp',
+    'time_boot_ms', 'time_usec',
+    'udp_time_relative', 'tcp_time_relative',
+
+    # MAVLink packet headers — transport-layer, not message content
+    'magic', 'payloadLength',
+    'incompatibilityFlags', 'compatibilityFlags',
+    'seq', 'sysid', 'compid', 'msgid',
+    'checksum', 'signature',
+
+    # IP header fields
+    'ip_version', 'ip_hdr_len', 'ip_tos', 'ip_len', 'ip_id',
+    'ip_flags', 'ip_frag_offset', 'ip_ttl', 'ip_proto',
+    'ip_src', 'ip_addr', 'ip_src_host', 'ip_host',
+    'ip_dst', 'ip_dst_host',
+    'ip_checksum', 'ip_checksum_status', 'ip_payload',
+
+    # UDP header fields
+    'udp_srcport', 'udp_dstport', 'udp_length',
     'udp_checksum', 'udp_checksum_status',
+    'udp_payload', 'udp_text',
+
+    # TCP header fields
+    'tcp_srcport', 'tcp_dstport', 'tcp_seq', 'tcp_ack',
+    'tcp_hdr_len', 'tcp_flags', 'tcp_flags_str',
+    'tcp_window_size', 'tcp_urgent_pointer',
     'tcp_checksum', 'tcp_checksum_status',
-    'tcp_flags_str', 'udp_text', 'tcp_text',
     'tcp_options', 'tcp_options_nop', 'tcp_options_timestamp',
-    'udp_payload', 'ip_payload'
+    'tcp_payload', 'tcp_text',
 ]
 
 ATTACK_FEATURE_MAP = {
@@ -231,14 +256,28 @@ def engineer_features(df, core_cols, csv_name):
         c == col or c.startswith(col + '_') for col in core_cols
     ) or c in extra]
 
+    # One-time print of the final feature column set so the user can verify
+    # what the model actually trains on. Useful catch for "did time get dropped?"
+    global _LOGGED_FEATURES
+    if not _LOGGED_FEATURES:
+        dropped = sorted(c for c in df.columns if c not in keep)
+        print(f"\n── Feature set ({csv_name}) ──")
+        print(f"  Kept ({len(keep)}): {sorted(keep)}")
+        if dropped:
+            preview = dropped if len(dropped) <= 12 else dropped[:12] + ['…']
+            print(f"  Dropped ({len(dropped)}): {preview}")
+        _LOGGED_FEATURES = True
+
     return df[keep].fillna(0)
+
+
+_LOGGED_FEATURES = False
 
 
 def preprocess_df(df, core_cols, csv_name):
     df = df.drop(columns=[c for c in DROP_COLS if c in df.columns], errors='ignore')
-    for col in ABSOLUTE_TIME_COLS:
-        if col in df.columns:
-            df[col] = df[col].diff().fillna(0)
+    # Keep only numeric columns. String/object cols (mav_packet_type, etc.)
+    # already in DROP_COLS, but this guards against new MAVLink string fields.
     df = df.select_dtypes(include=[np.number])
     df = df.fillna(0)
     df = engineer_features(df, core_cols, csv_name)
@@ -555,16 +594,25 @@ if __name__ == "__main__":
     print(f"After metadata check: {len(drone_files)} drone file(s) across "
           f"{len(run_paths)} run(s) — {n_benign_runs} benign / {n_attack_runs} attack")
 
-    # ── Per-run 3-way split — train / val / test, stratified by class ───────
-    # Run-level isolation: drones from one run never span folds. The test
-    # set is held out from BOTH fit and callbacks — only used once at the end.
-    if len(run_paths) < 3:
+    # ── Per-DRONE 3-way split — train / val / test, stratified by class ─────
+    # Drones are the atomic unit, not runs. Each drone is an independently
+    # simulated physics process with its own FC and MAVLink stream — the
+    # ATTITUDE signal of drone N is uncorrelated with drone M's.
+    #
+    # Window-level splits would leak (97.5% sample overlap with stride=2);
+    # run-level splits are too coarse at N=6 (test ends up single-class).
+    # Drone-level keeps all windows from a single drone in one fold (no
+    # within-drone temporal leakage) while giving ~260 atomic units to
+    # split — clean stratification and a meaningful held-out test set.
+    if len(drone_files) < 10:
         raise RuntimeError(
-            f"Only {len(run_paths)} run(s) found; need at least 3 for "
-            f"train/val/test. Run more sims before training."
+            f"Only {len(drone_files)} drone file(s) found; need at least 10 "
+            f"for a meaningful train/val/test split."
         )
 
-    stratify = [run_labels[r] for r in run_paths]
+    drone_labels = [
+        run_labels[os.path.dirname(os.path.dirname(f))] for f in drone_files
+    ]
 
     def _safe_stratified_split(items, test_size, strat, label):
         try:
@@ -576,30 +624,24 @@ if __name__ == "__main__":
                   f"falling back to unstratified.")
             return train_test_split(items, test_size=test_size, random_state=42)
 
-    # Split off test first so it stays sacrosanct.
-    trainval_runs, test_runs = _safe_stratified_split(
-        run_paths, args.test_frac, stratify, "test"
+    # Split off test first so it stays sacrosanct (never seen during fit).
+    trainval_files, test_files, trainval_labels, _ = train_test_split(
+        drone_files, drone_labels,
+        test_size=args.test_frac, random_state=42, stratify=drone_labels,
     )
     # Then split the remaining into train/val.
-    trainval_stratify = [run_labels[r] for r in trainval_runs]
-    train_runs, val_runs = _safe_stratified_split(
-        trainval_runs, args.val_frac, trainval_stratify, "val"
+    train_files, val_files = _safe_stratified_split(
+        trainval_files, args.val_frac, trainval_labels, "val"
     )
 
-    train_files = [f for r in train_runs for f in runs[r]]
-    val_files   = [f for r in val_runs   for f in runs[r]]
-    test_files  = [f for r in test_runs  for f in runs[r]]
-
-    def _class_summary(rs):
-        c = Counter(run_labels[r] for r in rs)
+    def _class_summary(files):
+        c = Counter(run_labels[os.path.dirname(os.path.dirname(f))] for f in files)
         return f"{c.get('benign', 0)}B/{c.get('attack', 0)}A"
 
-    print(f"Train: {len(train_runs)} run(s) ({_class_summary(train_runs)}, "
-          f"{len(train_files)} drones)")
-    print(f"Val:   {len(val_runs)} run(s) ({_class_summary(val_runs)}, "
-          f"{len(val_files)} drones)")
-    print(f"Test:  {len(test_runs)} run(s) ({_class_summary(test_runs)}, "
-          f"{len(test_files)} drones)  [held out — only evaluated post-fit]")
+    print(f"Train: {len(train_files)} drone(s) ({_class_summary(train_files)})")
+    print(f"Val:   {len(val_files)} drone(s) ({_class_summary(val_files)})")
+    print(f"Test:  {len(test_files)} drone(s) ({_class_summary(test_files)})  "
+          f"[held out — only evaluated post-fit]")
 
     # ── Save Stage 1 config (used by live detector at inference time) ─────────
     # TODO: per-window Stage 1 flat-line filtering during inference
