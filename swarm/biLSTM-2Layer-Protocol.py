@@ -106,7 +106,7 @@ def classify_sim(sim_path, primary_csv):
     file_path = os.path.join(sim_path, primary_csv)
     if not os.path.exists(file_path):
         return 'missing'
-    df  = pd.read_csv(file_path)
+    df  = pd.read_csv(file_path, low_memory=False)
     cfg = get_frozen_config(primary_csv)
     if cfg is None:
         return 'subtle'
@@ -257,7 +257,7 @@ def load_window_normalize_sim(sim_path, primary_csv, label,
     file_path = os.path.join(sim_path, primary_csv)
     if not os.path.exists(file_path):
         return None
-    df = pd.read_csv(file_path)
+    df = pd.read_csv(file_path, low_memory=False)
     if 'timestamp' in df.columns:
         df = df.sort_values('timestamp')
     df       = preprocess_df(df, core_cols, primary_csv)
@@ -378,7 +378,7 @@ def load_window_normalize_log(
         raise ValueError(f"run_label must be 'benign' or 'attack', got {run_label!r}")
     del label_policy  # explicitly unused
 
-    df = pd.read_csv(log_path)
+    df = pd.read_csv(log_path, low_memory=False)
     df = df[df["mav_packet_type"] == primary_type].copy()
 
     # Apply the per-run filter rule before windowing.
