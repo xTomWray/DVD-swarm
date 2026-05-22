@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import os
 import argparse
+import json
 import pickle
 from collections import Counter
 from sklearn.preprocessing import StandardScaler
@@ -274,13 +275,38 @@ def load_window_normalize_sim(sim_path, primary_csv, label,
     return (windows, label)
 
 
+def _run_label_from_metadata(run_dir: str) -> str | None:
+    """Return ``'benign'`` or ``'attack'`` based on the run's metadata.json.
+
+    Training-set rules:
+      - Runs with ``attack == 'none'`` contribute every row as a benign sample.
+      - Runs with any other ``attack`` value contribute only their attack-tagged
+        rows; null-tagged rows inside an attack run are contaminated broadcasts
+        (couldn't be attributed to a drone) and must be excluded.
+
+    Returns ``None`` when metadata.json is missing or unreadable so the caller
+    can skip the run rather than mislabel its data.
+    """
+    meta_path = os.path.join(run_dir, "metadata.json")
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path) as f:
+            meta = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return "benign" if str(meta.get("attack", "")).lower() == "none" else "attack"
+
+
 def load_window_normalize_log(
     log_path: str,
     primary_type: str,
     window_size: int,
     stride: int,
     core_cols: list[str],
-    label_policy: str = "any",
+    *,
+    run_label: str,
+    label_policy: str = "any",  # retained for API compat; ignored when run_label is set
 ) -> tuple[list[np.ndarray], list[int]] | None:
     """Load one per-drone log file, slide windows, return per-window labels.
 
@@ -290,9 +316,11 @@ def load_window_normalize_log(
     needed — and we just filter to primary_type, sort by timestamp, and
     slide windows.
 
-    Per-window labels come from the attack_type column under label_policy.
-    The attack flag is captured before preprocess_df strips non-numeric
-    columns.
+    Labels come from the *run's* ``attack`` field (via ``run_label``), not
+    from per-row ``attack_type``:
+      - ``run_label='benign'``: keep every row, label every window 0.
+      - ``run_label='attack'``: drop rows where ``attack_type == 'null'``
+        (contaminated broadcasts), label every remaining window 1.
 
     Args:
         log_path: Path to one drone's CSV (e.g. ``.../csv/drone_005.csv``).
@@ -300,23 +328,30 @@ def load_window_normalize_log(
         window_size: Number of timesteps per window.
         stride: Step between successive windows.
         core_cols: Feature columns used by engineer_features / preprocess_df.
-        label_policy: How to label each window:
-            ``"any"``      - 1 if any row in the window is an attack.
-            ``"majority"`` - 1 if more than half the rows are attacks.
-            ``"all"``      - 1 if every row in the window is an attack.
+        run_label: ``'benign'`` or ``'attack'`` — typically supplied by
+            ``_run_label_from_metadata`` for the run dir containing log_path.
+        label_policy: Retained for backward compatibility, no longer used.
 
     Returns:
         ``(windows, labels)`` lists, or ``None`` if the file has fewer than
-        ``window_size`` rows of ``primary_type``.
+        ``window_size`` qualifying rows of ``primary_type``.
     """
+    if run_label not in ("benign", "attack"):
+        raise ValueError(f"run_label must be 'benign' or 'attack', got {run_label!r}")
+    del label_policy  # explicitly unused
+
     df = pd.read_csv(log_path)
     df = df[df["mav_packet_type"] == primary_type].copy()
+
+    # Apply the per-run filter rule before windowing.
+    if run_label == "attack":
+        df = df[df["attack_type"] != "null"].copy()
+
     if len(df) < window_size:
         return None
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # Capture attack flag BEFORE preprocess_df removes the string column.
-    attack_flag: np.ndarray = (df["attack_type"] != "null").astype(int).to_numpy()
+    binary_label = 1 if run_label == "attack" else 0
 
     pseudo_csv = primary_type + ".csv"
     df_processed = preprocess_df(df, core_cols, pseudo_csv)
@@ -327,22 +362,13 @@ def load_window_normalize_log(
     windows: list[np.ndarray] = []
     labels: list[int] = []
     for i in range(0, len(features) - window_size + 1, stride):
-        window_flags = attack_flag[i : i + window_size]
-        if label_policy == "majority":
-            label = int(window_flags.mean() > 0.5)
-        elif label_policy == "all":
-            label = int(window_flags.all())
-        else:  # "any" (default)
-            label = int(window_flags.any())
         windows.append(features[i : i + window_size])
-        labels.append(label)
+        labels.append(binary_label)
 
     if not windows:
         return None
 
-    n_attack = sum(labels)
-    print(f"  Loaded {len(windows):>5} windows ({n_attack} attack, "
-          f"{len(windows) - n_attack} benign) <- {log_path}")
+    print(f"  Loaded {len(windows):>5} {run_label} windows <- {log_path}")
     return (windows, labels)
 
 
@@ -424,15 +450,47 @@ if __name__ == "__main__":
     run_paths = sorted(runs.keys())
     print(f"Found {len(drone_files)} drone file(s) across {len(run_paths)} run(s)")
 
-    # ── Per-run 80/20 split — run-level isolation ────────────────────────────
+    # ── Run-level class assignment via metadata.json ─────────────────────────
+    # benign  = rows from runs where the run's `attack` field is 'none'
+    # attack  = rows where attack_type != 'null' inside an attack run
+    # Runs missing metadata.json are skipped (can't tell which class).
+    run_labels: dict[str, str] = {}
+    for run_path in run_paths:
+        rl = _run_label_from_metadata(run_path)
+        if rl is None:
+            print(f"  WARN: skipping {run_path} — no readable metadata.json")
+            continue
+        run_labels[run_path] = rl
+
+    if not run_labels:
+        raise RuntimeError("No runs had readable metadata.json — cannot label data.")
+
+    runs = {k: v for k, v in runs.items() if k in run_labels}
+    run_paths = sorted(runs.keys())
+    drone_files = [f for r in run_paths for f in runs[r]]
+    n_benign_runs = sum(1 for v in run_labels.values() if v == "benign")
+    n_attack_runs = sum(1 for v in run_labels.values() if v == "attack")
+    print(f"After metadata check: {len(drone_files)} drone file(s) across "
+          f"{len(run_paths)} run(s) — {n_benign_runs} benign / {n_attack_runs} attack")
+
+    # ── Per-run 80/20 split — run-level isolation, stratified by class ───────
     if len(run_paths) < 2:
         raise RuntimeError(
             f"Only {len(run_paths)} run found; need at least 2 for an 80/20 split. "
             "Run more sims before training."
         )
-    train_runs, val_runs = train_test_split(
-        run_paths, test_size=0.2, random_state=42
-    )
+    stratify = [run_labels[r] for r in run_paths]
+    try:
+        train_runs, val_runs = train_test_split(
+            run_paths, test_size=0.2, random_state=42, stratify=stratify
+        )
+    except ValueError:
+        # Stratification fails if any class has <2 runs. Fall back to plain split.
+        print("  WARN: stratified split failed (need ≥2 runs per class); "
+              "falling back to unstratified.")
+        train_runs, val_runs = train_test_split(
+            run_paths, test_size=0.2, random_state=42
+        )
     train_files = [f for r in train_runs for f in runs[r]]
     val_files   = [f for r in val_runs   for f in runs[r]]
     print(f"Train runs: {len(train_runs)} ({len(train_files)} drones)  |  "
@@ -462,9 +520,11 @@ if __name__ == "__main__":
 
     print("\n── Loading train sims ────────────────────────────────────────────")
     for f in train_files:
+        run_dir = os.path.dirname(os.path.dirname(f))
         out = load_window_normalize_log(
             f, args.primary_type,
             args.window_size, args.stride, core_cols,
+            run_label=run_labels[run_dir],
             label_policy=args.label_policy,
         )
         if out is None:
@@ -476,9 +536,11 @@ if __name__ == "__main__":
 
     print("\n── Loading val sims ──────────────────────────────────────────────")
     for f in val_files:
+        run_dir = os.path.dirname(os.path.dirname(f))
         out = load_window_normalize_log(
             f, args.primary_type,
             args.window_size, args.stride, core_cols,
+            run_label=run_labels[run_dir],
             label_policy=args.label_policy,
         )
         if out is None:
