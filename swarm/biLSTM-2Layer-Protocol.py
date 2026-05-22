@@ -275,6 +275,44 @@ def load_window_normalize_sim(sim_path, primary_csv, label,
     return (windows, label)
 
 
+def _configure_gpus(mixed_precision: bool) -> None:
+    """Detect GPUs, enable memory growth, optionally enable mixed precision.
+
+    Loud-prints what TF will train on so a silent CPU fallback can't waste
+    hours of wall time. Raises nothing — if GPUs aren't detected the script
+    still runs (just slowly).
+    """
+    gpus = tf.config.list_physical_devices("GPU")
+    if not gpus:
+        print("⚠  No GPU detected — training will run on CPU (slow).")
+        print("   If this is a GPU box, check: nvidia-smi, CUDA install, "
+              "and that TensorFlow was built with GPU support.")
+        return
+
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as exc:
+            # Already initialised — non-fatal.
+            print(f"   note: could not enable memory growth on {gpu.name}: {exc}")
+
+    logical = tf.config.list_logical_devices("GPU")
+    print(f"✓ TensorFlow sees {len(gpus)} physical GPU(s), {len(logical)} logical:")
+    for gpu in gpus:
+        try:
+            details = tf.config.experimental.get_device_details(gpu)
+            name = details.get("device_name", "unknown")
+            cc = details.get("compute_capability", "?")
+            print(f"   - {gpu.name}  ({name}, compute {cc})")
+        except Exception:
+            print(f"   - {gpu.name}")
+
+    if mixed_precision:
+        from tensorflow.keras import mixed_precision as mp
+        mp.set_global_policy("mixed_float16")
+        print(f"✓ Mixed precision enabled (policy: {mp.global_policy().name})")
+
+
 def _run_label_from_metadata(run_dir: str) -> str | None:
     """Return ``'benign'`` or ``'attack'`` based on the run's metadata.json.
 
@@ -411,7 +449,16 @@ if __name__ == "__main__":
     parser.add_argument('--window-size',   type=int, default=80)
     parser.add_argument('--stride',        type=int, default=2)
     parser.add_argument('--output',        type=str, default=None)
+    parser.add_argument('--mixed-precision', action='store_true',
+                        help='Enable float16 mixed precision (≈2× faster on Volta+ GPUs).')
+    parser.add_argument('--cpu', action='store_true',
+                        help='Force CPU-only execution (hide all GPUs from TF).')
     args = parser.parse_args()
+
+    if args.cpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+        print("CUDA_VISIBLE_DEVICES=-1 set — TF will run on CPU.")
+    _configure_gpus(args.mixed_precision)
 
     tf.random.set_seed(42)
     np.random.seed(42)
@@ -621,7 +668,9 @@ if __name__ == "__main__":
 
         Dense(32, activation='relu', kernel_regularizer=l2(1e-5)),
         Dropout(0.2),
-        Dense(1, activation='sigmoid')
+        # dtype='float32' keeps the loss in fp32 even when mixed_precision
+        # is enabled — avoids underflow in focal_loss.
+        Dense(1, activation='sigmoid', dtype='float32')
     ])
 
     model.compile(
