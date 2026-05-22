@@ -105,40 +105,11 @@ def get_feature_cols(csv_name):
     return None
 
 
-def get_frozen_config(csv_name):
-    key = csv_name.replace('.csv', '').upper()
-    for k, cfg in FROZEN_CONFIG.items():
-        if k in key:
-            return cfg
-    return None
-
-
-# ── Stage 1: Rule-based flat-line detector ────────────────────────────────────
-def is_flat_line(df, frozen_cols, threshold=1e-6):
-    """
-    Returns True if any core column has near-zero variance.
-    A real drone NEVER has frozen sensor values.
-    """
-    for col in frozen_cols:
-        if col in df.columns:
-            if df[col].var() < threshold:
-                return True
-    return False
-
-
-def classify_sim(sim_path, primary_csv):
-    """Classify a simulation as flat-line or subtle attack."""
-    file_path = os.path.join(sim_path, primary_csv)
-    if not os.path.exists(file_path):
-        return 'missing'
-    df  = pd.read_csv(file_path, low_memory=False)
-    cfg = get_frozen_config(primary_csv)
-    if cfg is None:
-        return 'subtle'
-    return 'flat' if is_flat_line(df, cfg['cols'], cfg['threshold']) else 'subtle'
-
-
 # ── Feature engineering ───────────────────────────────────────────────────────
+# Single-shot guard for the one-time feature-name log inside engineer_features.
+_LOGGED_FEATURES = False
+
+
 def rolling_autocorr(series, window, lag=1):
     s1  = series
     s2  = series.shift(lag)
@@ -250,14 +221,17 @@ def engineer_features(df, core_cols, csv_name):
         new_cols[f'{col}_zscore'] = ((df[col] - local_mean) / local_std).fillna(0)
 
     df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
+    # The specialised engineer_*_features() above can create columns like
+    # roll_d1, roll_std_20 that the generic loop also creates — concat would
+    # otherwise leave duplicated column labels. Keep the last occurrence
+    # (the generic loop uses min_periods=1, which is what we want).
+    df = df.loc[:, ~df.columns.duplicated(keep='last')]
 
     extra = ['rate_mag', 'rate_mag_std_20', 'attitude_mag']
     keep  = [c for c in df.columns if any(
         c == col or c.startswith(col + '_') for col in core_cols
     ) or c in extra]
 
-    # One-time print of the final feature column set so the user can verify
-    # what the model actually trains on. Useful catch for "did time get dropped?"
     global _LOGGED_FEATURES
     if not _LOGGED_FEATURES:
         dropped = sorted(c for c in df.columns if c not in keep)
@@ -269,9 +243,6 @@ def engineer_features(df, core_cols, csv_name):
         _LOGGED_FEATURES = True
 
     return df[keep].fillna(0)
-
-
-_LOGGED_FEATURES = False
 
 
 def preprocess_df(df, core_cols, csv_name):
@@ -289,29 +260,6 @@ def normalize_simulation(features):
     reshaped = features.reshape(-1, features.shape[-1])
     scaled   = scaler.fit_transform(reshaped)
     return scaled.reshape(features.shape)
-
-
-def load_window_normalize_sim(sim_path, primary_csv, label,
-                               window_size, stride, core_cols):
-    file_path = os.path.join(sim_path, primary_csv)
-    if not os.path.exists(file_path):
-        return None
-    df = pd.read_csv(file_path, low_memory=False)
-    if 'timestamp' in df.columns:
-        df = df.sort_values('timestamp')
-    df       = preprocess_df(df, core_cols, primary_csv)
-    features = df.values
-    if len(features) <= window_size:
-        return None
-    features = normalize_simulation(features)
-    windows  = [
-        features[i:i + window_size]
-        for i in range(0, len(features) - window_size + 1, stride)
-    ]
-    if not windows:
-        return None
-    print(f"  Loaded {len(windows):>5} windows ← {sim_path}")
-    return (windows, label)
 
 
 def _configure_gpus(mixed_precision: bool) -> None:
@@ -383,7 +331,6 @@ def load_window_normalize_log(
     core_cols: list[str],
     *,
     run_label: str,
-    label_policy: str = "any",  # retained for API compat; ignored when run_label is set
 ) -> tuple[list[np.ndarray], list[int]] | None:
     """Load one per-drone log file, slide windows, return per-window labels.
 
@@ -407,7 +354,6 @@ def load_window_normalize_log(
         core_cols: Feature columns used by engineer_features / preprocess_df.
         run_label: ``'benign'`` or ``'attack'`` — typically supplied by
             ``_run_label_from_metadata`` for the run dir containing log_path.
-        label_policy: Retained for backward compatibility, no longer used.
 
     Returns:
         ``(windows, labels)`` lists, or ``None`` if the file has fewer than
@@ -415,7 +361,6 @@ def load_window_normalize_log(
     """
     if run_label not in ("benign", "attack"):
         raise ValueError(f"run_label must be 'benign' or 'attack', got {run_label!r}")
-    del label_policy  # explicitly unused
 
     # Prefer flight.parquet over the per-drone CSV — predicate pushdown
     # filters by drone_id + mav_packet_type at read time so we only touch
@@ -478,42 +423,12 @@ def load_window_normalize_log(
     return (windows, labels)
 
 
-def balance_sims(sims):
-    min_windows = min(len(w) for w, _ in sims)
-    balanced    = []
-    for windows, label in sims:
-        if len(windows) > min_windows:
-            idx = np.random.choice(len(windows), min_windows, replace=False)
-            balanced.append(([windows[i] for i in idx], label))
-        else:
-            balanced.append((windows, label))
-    return balanced
-
-
-def balance_classes(sims):
-    benign = [s for s in sims if s[1] == 0]
-    attack = [s for s in sims if s[1] == 1]
-    n      = min(len(benign), len(attack))
-    return benign[:n] + attack[:n]
-
-
-def flatten_sims(sims):
-    X, y = [], []
-    for windows, label in sims:
-        X.extend(windows)
-        y.extend([label] * len(windows))
-    return np.array(X), np.array(y)
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--data-dir',      type=str, required=True,
                         help='Root directory; all **/log.csv files under it are used.')
     parser.add_argument('--primary-type',  type=str, required=True,
                         help='MAVLink message type to train on, e.g. ATTITUDE.')
-    parser.add_argument('--label-policy',  type=str, default='any',
-                        choices=['any', 'majority', 'all'],
-                        help='Per-window label aggregation (default: any).')
     parser.add_argument('--window-size',   type=int, default=80)
     parser.add_argument('--stride',        type=int, default=2)
     parser.add_argument('--output',        type=str, default=None)
@@ -546,7 +461,6 @@ if __name__ == "__main__":
                          f"Add it to ATTACK_FEATURE_MAP.")
 
     print(f"\nPrimary type : {args.primary_type}")
-    print(f"Label policy : {args.label_policy}")
     print(f"Core features: {core_cols}")
 
     # ── Glob all per-drone log files ──────────────────────────────────────────
@@ -560,8 +474,8 @@ if __name__ == "__main__":
             "per-drone PacketWriter."
         )
 
-    # Group files by their parent run directory so the train/val split is
-    # at the RUN level — drones from one run never span both folds.
+    # Group files by their parent run directory. Used only for metadata
+    # lookup (run-level attack label); the actual split is per-drone below.
     runs: dict[str, list[str]] = {}
     for f in drone_files:
         # .../output/run_X/csv/drone_NNN.csv  ->  .../output/run_X
@@ -669,7 +583,6 @@ if __name__ == "__main__":
                 f, args.primary_type,
                 args.window_size, args.stride, core_cols,
                 run_label=run_labels[run_dir],
-                label_policy=args.label_policy,
             )
             if out is None:
                 continue
@@ -828,11 +741,16 @@ Actual Attack    {cm[1][0]:<6}           {cm[1][1]:<6}   (Missed Attacks)
 Actual Benign    {cm_t[0][0]:<6}           {cm_t[0][1]:<6}   (False Alarms)
 Actual Attack    {cm_t[1][0]:<6}           {cm_t[1][1]:<6}   (Missed Attacks)
 """)
-        # Per-run breakdown so we can see which held-out runs the model
-        # nailed vs which it struggled on.
-        print("Test run-level summary:")
-        for r in sorted(test_runs):
-            print(f"  {run_labels[r]:<7}  {os.path.basename(r)}")
+        # Per-run breakdown of where the test drones came from, so a bad
+        # test score can be traced back to which run(s) the model misread.
+        test_runs_present = sorted({
+            os.path.dirname(os.path.dirname(f)) for f in test_files
+        })
+        print("Test runs represented:")
+        for r in test_runs_present:
+            n_drones = sum(1 for f in test_files
+                           if os.path.dirname(os.path.dirname(f)) == r)
+            print(f"  {run_labels[r]:<7}  {os.path.basename(r)}  ({n_drones} drone(s))")
     elif len(X_test) == 0:
         print("\n⚠  No test windows produced — test set may have been too small.")
     else:
