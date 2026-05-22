@@ -54,25 +54,47 @@ master = mavutil.mavlink_connection(connection_string)
 master.wait_heartbeat()
 print(f"Heartbeat from system (system {master.target_system} component {master.target_component})")
 
-# param_set_send overwrites regardless of eeprom.bin; --add-param-file only sets defaults
+# Validated single-drone flight params. Inject via PARAM_SET + wait for the
+# PARAM_VALUE ack, otherwise ArduPilot silently drops some sends and the
+# eeprom-saved value wins (observed: ~10 m/s cruise instead of the 9.72 m/s
+# these params should give).
 _flight_params = {
-    "WPNAV_SPEED": 2000.0,
-    "WPNAV_ACCEL": 500.0,
-    "WPNAV_ACCEL_Z": 200.0,
-    "WPNAV_SPEED_UP": 500.0,
-    "WPNAV_SPEED_DN": 300.0,
-    "MIS_RESTART": 1.0,
+    "WPNAV_SPEED": 972.0,
+    "LOIT_SPEED": 972.0,
+    "WPNAV_SPEED_UP": 700.0,
+    "WPNAV_SPEED_DN": 400.0,
 }
+
+
+def _set_param_confirmed(name, value, max_attempts=5, ack_timeout=2.0):
+    name_bytes = name.encode("utf-8").ljust(16, b"\x00")
+    for attempt in range(1, max_attempts + 1):
+        master.mav.param_set_send(
+            master.target_system,
+            master.target_component,
+            name_bytes,
+            value,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+        )
+        deadline = time.time() + ack_timeout
+        while time.time() < deadline:
+            msg = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=ack_timeout)
+            if msg is None:
+                break
+            ack_id = msg.param_id
+            if isinstance(ack_id, bytes):
+                ack_id = ack_id.split(b"\x00", 1)[0].decode("utf-8", "replace")
+            if ack_id == name and abs(msg.param_value - value) < 0.5:
+                print(f"  {name} = {msg.param_value} (confirmed, attempt {attempt})")
+                return True
+        print(f"  {name} = {value} not confirmed on attempt {attempt}, retrying…")
+    print(f"  {name} = {value} FAILED after {max_attempts} attempts")
+    return False
+
+
+print("Injecting flight params…")
 for _name, _val in _flight_params.items():
-    master.mav.param_set_send(
-        master.target_system,
-        master.target_component,
-        _name.encode("utf-8"),
-        _val,
-        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
-    )
-    time.sleep(0.1)
-print("Flight params injected via MAVLink")
+    _set_param_confirmed(_name, _val)
 
 master.waypoint_clear_all_send()
 print("Clearing waypoints...")
