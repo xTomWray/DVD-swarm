@@ -378,8 +378,37 @@ def load_window_normalize_log(
         raise ValueError(f"run_label must be 'benign' or 'attack', got {run_label!r}")
     del label_policy  # explicitly unused
 
-    df = pd.read_csv(log_path, low_memory=False)
-    df = df[df["mav_packet_type"] == primary_type].copy()
+    # Prefer flight.parquet over the per-drone CSV — predicate pushdown
+    # filters by drone_id + mav_packet_type at read time so we only touch
+    # the relevant rows. 10-100x faster than reading every CSV in full.
+    run_dir = os.path.dirname(os.path.dirname(log_path))
+    pq_path = os.path.join(run_dir, "flight.parquet")
+    used_parquet = False
+    if os.path.exists(pq_path):
+        try:
+            drone_id = int(
+                os.path.basename(log_path).replace("drone_", "").replace(".csv", "")
+            )
+            df = pd.read_parquet(
+                pq_path,
+                filters=[
+                    ("drone_id", "==", drone_id),
+                    ("mav_packet_type", "==", primary_type),
+                ],
+            )
+            # analyze.py writes parquet with all_varchar=true (handles the
+            # mixed-type checksum column). Coerce numerics back here.
+            keep_str = {"mav_packet_type", "attack_type"}
+            for col in df.columns:
+                if col not in keep_str:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            used_parquet = True
+        except Exception as exc:
+            print(f"  parquet read failed for {pq_path} ({exc!s}); falling back to CSV")
+
+    if not used_parquet:
+        df = pd.read_csv(log_path, low_memory=False)
+        df = df[df["mav_packet_type"] == primary_type].copy()
 
     # Apply the per-run filter rule before windowing.
     if run_label == "attack":
