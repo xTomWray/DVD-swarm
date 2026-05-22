@@ -478,6 +478,12 @@ if __name__ == "__main__":
     parser.add_argument('--window-size',   type=int, default=80)
     parser.add_argument('--stride',        type=int, default=2)
     parser.add_argument('--output',        type=str, default=None)
+    parser.add_argument('--test-frac', type=float, default=0.2,
+                        help='Fraction of runs reserved for the held-out test set '
+                             '(default 0.2 = nested 80/20: train 64%%, val 16%%, test 20%%).')
+    parser.add_argument('--val-frac', type=float, default=0.2,
+                        help='Fraction of non-test runs used for validation '
+                             '(default 0.2 of the remaining 80%% = 16%% of total).')
     parser.add_argument('--mixed-precision', action='store_true',
                         help='Enable float16 mixed precision (≈2× faster on Volta+ GPUs).')
     parser.add_argument('--cpu', action='store_true',
@@ -549,28 +555,51 @@ if __name__ == "__main__":
     print(f"After metadata check: {len(drone_files)} drone file(s) across "
           f"{len(run_paths)} run(s) — {n_benign_runs} benign / {n_attack_runs} attack")
 
-    # ── Per-run 80/20 split — run-level isolation, stratified by class ───────
-    if len(run_paths) < 2:
+    # ── Per-run 3-way split — train / val / test, stratified by class ───────
+    # Run-level isolation: drones from one run never span folds. The test
+    # set is held out from BOTH fit and callbacks — only used once at the end.
+    if len(run_paths) < 3:
         raise RuntimeError(
-            f"Only {len(run_paths)} run found; need at least 2 for an 80/20 split. "
-            "Run more sims before training."
+            f"Only {len(run_paths)} run(s) found; need at least 3 for "
+            f"train/val/test. Run more sims before training."
         )
+
     stratify = [run_labels[r] for r in run_paths]
-    try:
-        train_runs, val_runs = train_test_split(
-            run_paths, test_size=0.2, random_state=42, stratify=stratify
-        )
-    except ValueError:
-        # Stratification fails if any class has <2 runs. Fall back to plain split.
-        print("  WARN: stratified split failed (need ≥2 runs per class); "
-              "falling back to unstratified.")
-        train_runs, val_runs = train_test_split(
-            run_paths, test_size=0.2, random_state=42
-        )
+
+    def _safe_stratified_split(items, test_size, strat, label):
+        try:
+            return train_test_split(
+                items, test_size=test_size, random_state=42, stratify=strat
+            )
+        except ValueError as exc:
+            print(f"  WARN: stratified {label} split failed ({exc}); "
+                  f"falling back to unstratified.")
+            return train_test_split(items, test_size=test_size, random_state=42)
+
+    # Split off test first so it stays sacrosanct.
+    trainval_runs, test_runs = _safe_stratified_split(
+        run_paths, args.test_frac, stratify, "test"
+    )
+    # Then split the remaining into train/val.
+    trainval_stratify = [run_labels[r] for r in trainval_runs]
+    train_runs, val_runs = _safe_stratified_split(
+        trainval_runs, args.val_frac, trainval_stratify, "val"
+    )
+
     train_files = [f for r in train_runs for f in runs[r]]
     val_files   = [f for r in val_runs   for f in runs[r]]
-    print(f"Train runs: {len(train_runs)} ({len(train_files)} drones)  |  "
-          f"Val runs: {len(val_runs)} ({len(val_files)} drones)")
+    test_files  = [f for r in test_runs  for f in runs[r]]
+
+    def _class_summary(rs):
+        c = Counter(run_labels[r] for r in rs)
+        return f"{c.get('benign', 0)}B/{c.get('attack', 0)}A"
+
+    print(f"Train: {len(train_runs)} run(s) ({_class_summary(train_runs)}, "
+          f"{len(train_files)} drones)")
+    print(f"Val:   {len(val_runs)} run(s) ({_class_summary(val_runs)}, "
+          f"{len(val_files)} drones)")
+    print(f"Test:  {len(test_runs)} run(s) ({_class_summary(test_runs)}, "
+          f"{len(test_files)} drones)  [held out — only evaluated post-fit]")
 
     # ── Save Stage 1 config (used by live detector at inference time) ─────────
     # TODO: per-window Stage 1 flat-line filtering during inference
@@ -587,46 +616,33 @@ if __name__ == "__main__":
     print(f"\n✓ Stage 1 config saved → stage1_{attack_id}.pkl")
 
     # ── Load windows — one file = one drone = one sim ─────────────────────────
-    all_train_windows: list[np.ndarray] = []
-    all_train_labels:  list[int]        = []
-    all_val_windows:   list[np.ndarray] = []
-    all_val_labels:    list[int]        = []
-    n_train_sims = 0
-    n_val_sims   = 0
+    def _load_split(files, name):
+        windows: list[np.ndarray] = []
+        labels: list[int] = []
+        n_sims = 0
+        print(f"\n── Loading {name} sims ────────────────────────────────────────────")
+        for f in files:
+            run_dir = os.path.dirname(os.path.dirname(f))
+            out = load_window_normalize_log(
+                f, args.primary_type,
+                args.window_size, args.stride, core_cols,
+                run_label=run_labels[run_dir],
+                label_policy=args.label_policy,
+            )
+            if out is None:
+                continue
+            ws, ls = out
+            windows.extend(ws)
+            labels.extend(ls)
+            n_sims += 1
+        return windows, labels, n_sims
 
-    print("\n── Loading train sims ────────────────────────────────────────────")
-    for f in train_files:
-        run_dir = os.path.dirname(os.path.dirname(f))
-        out = load_window_normalize_log(
-            f, args.primary_type,
-            args.window_size, args.stride, core_cols,
-            run_label=run_labels[run_dir],
-            label_policy=args.label_policy,
-        )
-        if out is None:
-            continue
-        ws, ls = out
-        all_train_windows.extend(ws)
-        all_train_labels.extend(ls)
-        n_train_sims += 1
+    all_train_windows, all_train_labels, n_train_sims = _load_split(train_files, "train")
+    all_val_windows,   all_val_labels,   n_val_sims   = _load_split(val_files,   "val")
+    all_test_windows,  all_test_labels,  n_test_sims  = _load_split(test_files,  "test")
 
-    print("\n── Loading val sims ──────────────────────────────────────────────")
-    for f in val_files:
-        run_dir = os.path.dirname(os.path.dirname(f))
-        out = load_window_normalize_log(
-            f, args.primary_type,
-            args.window_size, args.stride, core_cols,
-            run_label=run_labels[run_dir],
-            label_policy=args.label_policy,
-        )
-        if out is None:
-            continue
-        ws, ls = out
-        all_val_windows.extend(ws)
-        all_val_labels.extend(ls)
-        n_val_sims += 1
-
-    print(f"\nTrain sims (drones): {n_train_sims}  |  Val sims (drones): {n_val_sims}")
+    print(f"\nTrain sims (drones): {n_train_sims}  |  "
+          f"Val sims: {n_val_sims}  |  Test sims: {n_test_sims}")
 
     if not all_train_windows:
         raise RuntimeError("No training windows produced — check --data-dir and --primary-type.")
@@ -635,10 +651,13 @@ if __name__ == "__main__":
     y_train = np.array(all_train_labels)
     X_val   = np.array(all_val_windows)
     y_val   = np.array(all_val_labels)
+    X_test  = np.array(all_test_windows) if all_test_windows else np.empty((0, args.window_size, 0))
+    y_test  = np.array(all_test_labels)
 
     raw_train_dist = Counter(y_train.tolist())
     print(f"\nRaw train class distribution : {raw_train_dist}")
     print(f"Val class distribution        : {Counter(y_val.tolist())}")
+    print(f"Test class distribution       : {Counter(y_test.tolist())}")
 
     # ── Window-level class balancing (train only) ─────────────────────────────
     n_minority = min(raw_train_dist.get(0, 0), raw_train_dist.get(1, 0))
@@ -735,28 +754,52 @@ if __name__ == "__main__":
         callbacks=callbacks
     )
 
-    # ── Evaluation ────────────────────────────────────────────────────────────
+    # ── Validation evaluation (tuning) ────────────────────────────────────────
+    # Use the val set to pick the operating threshold (max F1). Test set
+    # results below use this SAME threshold — never re-tuned on test.
     y_pred_prob = model.predict(X_val, verbose=0)
     prec, rec, thresh = precision_recall_curve(y_val, y_pred_prob)
     f1          = 2 * (prec * rec) / (prec + rec + 1e-9)
     best_thresh = thresh[np.argmax(f1)]
-    print(f"\nOptimal threshold (subtle) : {best_thresh:.4f}")
+    print(f"\nOptimal threshold (from val) : {best_thresh:.4f}")
 
     y_pred = (y_pred_prob >= best_thresh).astype(int)
-    print("\nClassification Report (subtle attacks only):")
+    print("\n── Val classification report ─────────────────────────────────────")
     print(classification_report(y_val, y_pred, target_names=['Benign', 'Attack'], digits=4))
-
     cm = confusion_matrix(y_val, y_pred)
-    print(f"""
-Confusion Matrix (subtle attacks):
+    print(f"""Val Confusion Matrix:
       Predicted Benign  Predicted Attack
 Actual Benign    {cm[0][0]:<6}           {cm[0][1]:<6}   (False Alarms)
 Actual Attack    {cm[1][0]:<6}           {cm[1][1]:<6}   (Missed Attacks)
-    """)
+""")
+
+    # ── Held-out test evaluation (final, untouched until now) ─────────────────
+    if len(X_test) > 0 and len(np.unique(y_test)) > 1:
+        y_test_prob = model.predict(X_test, verbose=0)
+        y_test_pred = (y_test_prob >= best_thresh).astype(int)
+        print("\n── TEST classification report (held-out runs) ────────────────────")
+        print(classification_report(y_test, y_test_pred,
+                                    target_names=['Benign', 'Attack'], digits=4))
+        cm_t = confusion_matrix(y_test, y_test_pred)
+        print(f"""Test Confusion Matrix:
+      Predicted Benign  Predicted Attack
+Actual Benign    {cm_t[0][0]:<6}           {cm_t[0][1]:<6}   (False Alarms)
+Actual Attack    {cm_t[1][0]:<6}           {cm_t[1][1]:<6}   (Missed Attacks)
+""")
+        # Per-run breakdown so we can see which held-out runs the model
+        # nailed vs which it struggled on.
+        print("Test run-level summary:")
+        for r in sorted(test_runs):
+            print(f"  {run_labels[r]:<7}  {os.path.basename(r)}")
+    elif len(X_test) == 0:
+        print("\n⚠  No test windows produced — test set may have been too small.")
+    else:
+        print(f"\n⚠  Test set has only one class ({Counter(y_test.tolist())}); "
+              f"skipping test eval. Consider adjusting --test-frac or run set.")
 
     print(f"\n── Combined system ──")
     print(f"Stage 1 (flat-line rule): see stage1_{attack_id}.pkl for live inference")
-    print(f"Stage 2 (ML): trained on per-window labels via policy '{args.label_policy}'")
+    print(f"Stage 2 (ML): trained on per-window labels, primary type '{args.primary_type}'")
 
     model.save(model_name)
     print(f"\n✓ Stage 2 model saved → {model_name}")
