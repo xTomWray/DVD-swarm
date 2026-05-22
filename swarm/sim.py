@@ -713,40 +713,6 @@ def main() -> int:
         )
         time.sleep(settle)
 
-        # Phase 6: set up label windows and start sniffer BEFORE the stage2/3
-        # POSTs so that MISSION_REQUEST/MISSION_ACK traffic is captured.
-        capture_start_epoch = time.time()
-        target_ids = (
-            parse_targets(args.targets) if args.targets
-            else drone_ids
-        )
-        # Don't attempt to attack drones that never came up.
-        target_ids = sorted(set(target_ids) & ready_drones)
-
-        # Benign-only runs use an empty window list — every row gets
-        # attack_type='null'. Attack runs install one window covering
-        # [start, end] for the targeted drones.
-        if args.attack == "none":
-            windows = []
-        else:
-            windows = [
-                AttackWindow(
-                    start_epoch=capture_start_epoch + args.start,
-                    end_epoch=capture_start_epoch + args.end,
-                    target_drones=frozenset(target_ids),
-                    attack_type=args.attack,
-                )
-            ]
-        labels = LabelLookup(windows)
-        writer = PacketWriter(
-            output_dir / "csv",
-            labels,
-            sim_uuid=output_dir.name,
-            drone_ids=drone_ids,
-        )
-        sniffer = start_sniffer(drone_ids, writer)
-        log.info("Capture started (epoch %.3f).", capture_start_epoch)
-
         # Phase 7a: POST /stage2 (arm-and-takeoff) to every ready drone.
         # Each POST execs ground-control-station/stages/arm-and-takeoff.py
         # inside the GCS container and blocks until the script returns.
@@ -767,6 +733,48 @@ def main() -> int:
             timeout=args.stage_http_timeout,
         )
         log.info("Drones at AUTO: %d/%d", len(auto), len(drone_ids))
+
+        if not auto:
+            raise RuntimeError("No drones reached AUTO — aborting.")
+
+        # Phase 6 (deferred until after staging): start sniffer only after
+        # all drones reach AUTO so the entire capture window contains actual
+        # flight data, not staging/arming traffic. The capture clock starts
+        # here; args.start/end are relative to this moment.
+        capture_start_epoch = time.time()
+        target_ids = (
+            parse_targets(args.targets) if args.targets
+            else sorted(auto)
+        )
+        # Only attack/capture drones that actually reached AUTO.
+        target_ids = sorted(set(target_ids) & auto)
+
+        # Benign-only runs use an empty window list — every row gets
+        # attack_type='null'. Attack runs install one window covering
+        # [start, end] for the targeted drones.
+        if args.attack == "none":
+            windows = []
+        else:
+            windows = [
+                AttackWindow(
+                    start_epoch=capture_start_epoch + args.start,
+                    end_epoch=capture_start_epoch + args.end,
+                    target_drones=frozenset(target_ids),
+                    attack_type=args.attack,
+                )
+            ]
+        labels = LabelLookup(windows)
+        writer = PacketWriter(
+            output_dir / "csv",
+            labels,
+            sim_uuid=output_dir.name,
+            drone_ids=sorted(auto),
+        )
+        sniffer = start_sniffer(sorted(auto), writer)
+        log.info(
+            "Capture started (epoch %.3f). %d/%d drone(s) in AUTO.",
+            capture_start_epoch, len(auto), len(drone_ids),
+        )
 
         if args.attack == "none":
             # Benign-only: no spoofing threads, just capture for the mission
