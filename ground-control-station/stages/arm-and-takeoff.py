@@ -54,6 +54,26 @@ master = mavutil.mavlink_connection(connection_string)
 master.wait_heartbeat()
 print(f"Heartbeat from system (system {master.target_system} component {master.target_component})")
 
+# param_set_send overwrites regardless of eeprom.bin; --add-param-file only sets defaults
+_flight_params = {
+    "WPNAV_SPEED": 2000.0,
+    "WPNAV_ACCEL": 500.0,
+    "WPNAV_ACCEL_Z": 200.0,
+    "WPNAV_SPEED_UP": 500.0,
+    "WPNAV_SPEED_DN": 300.0,
+    "MIS_RESTART": 1.0,
+}
+for _name, _val in _flight_params.items():
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        _name.encode("utf-8"),
+        _val,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+    )
+    time.sleep(0.1)
+print("Flight params injected via MAVLink")
+
 master.waypoint_clear_all_send()
 print("Clearing waypoints...")
 
