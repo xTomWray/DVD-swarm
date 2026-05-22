@@ -12,6 +12,7 @@ dependencies = [
     "pyyaml>=6.0",
     "pymavlink>=2.4",
     "requests>=2.31",
+    "duckdb>=1.1",
 ]
 
 [project.optional-dependencies]

@@ -12,7 +12,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -41,6 +41,11 @@ help:
 	@echo ""
 	@echo "  make sim-benign N=50 END=300 RUNS=5"
 	@echo "      Run RUNS benign-only captures (no attack, label=null on every row)."
+	@echo ""
+	@echo "  make analyze                         Canned report on the latest run."
+	@echo "  make analyze RUN=output/run_...      Report for a specific run."
+	@echo "  make analyze SQL='SELECT ...'        Ad-hoc query against view 'flight'."
+	@echo "  make analyze FORCE=1                 Rebuild flight.parquet."
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
@@ -319,6 +324,17 @@ restore:
 	tar -xf "$(ARCHIVE)" && \
 	echo "[make] done. Run dirs now in output/:"; \
 	ls -d output/run_* 2>/dev/null | tail -10
+
+# Fast post-run analysis. First call per run converts csv/drone_*.csv into
+# output/<run>/flight.parquet (ZSTD); subsequent calls are sub-second. The
+# default report covers attack-label coverage, row volume, message-type mix,
+# and VFR_HUD/ATTITUDE dynamics split by attack_type. Pass SQL='...' for an
+# ad-hoc query, RUN=output/run_... for a specific run, FORCE=1 to rebuild.
+analyze:
+	@cd .. && $(PYTHON) -m swarm.dataset.analyze \
+	    $(if $(RUN),--run $(RUN)) \
+	    $(if $(FORCE),--force) \
+	    $(if $(SQL),--sql "$(SQL)")
 
 # List archives newest first with file sizes. Shows both legacy .tar.gz
 # and new .tar.zst.
