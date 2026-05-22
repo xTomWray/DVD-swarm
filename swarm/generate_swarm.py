@@ -190,6 +190,7 @@ def _resource_limits(service: str) -> dict[str, str]:
 def flight_controller_service(n: int, raw_dir: Path) -> dict[str, Any]:
     """Build the flight-controller-lite service definition for instance N."""
     logs_path = str((raw_dir / f"instance-{n}").resolve())
+    _parm = str(_REPO_ROOT / "flight-controller/drone.parm")
     return {
         "image": IMAGES["flight-controller"],
         "container_name": f"flight-controller-lite-{n}",
@@ -197,6 +198,11 @@ def flight_controller_service(n: int, raw_dir: Path) -> dict[str, Any]:
         "volumes": [
             f"dvd-serial-{n}:/sockets",
             f"{logs_path}:/ardupilot/logs",
+            # stage1 runs sim_vehicle.py --add-param-file drone.parm inside
+            # the FC container (/ardupilot/drone.parm). Mount our repo copy so
+            # tuned params (WPNAV_SPEED etc.) take effect without rebuilding
+            # the image.
+            f"{_parm}:/ardupilot/drone.parm:ro",
         ],
         "environment": ["LITE=true"],
         "networks": {
