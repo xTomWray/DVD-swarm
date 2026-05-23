@@ -67,6 +67,19 @@ _flight_params = {
     # drones maneuvering for the full capture window so attack/null rows
     # both reflect active flight, not hover.
     "MIS_RESTART": 1.0,
+    # SR0_* stream rates (Hz). drone.parm sets these to 4 but the lite-image
+    # eeprom overrides them downward (observed ~0.3-0.7 Hz). Inject explicit
+    # rates to represent real-world ArduCopter telemetry density.
+    # Aggregate ≈ 67 msg/sec/drone; 50 drones ≈ 3.4k msg/sec — well under
+    # the per-thread pymavlink ceiling.
+    "SR0_EXTRA1":   25.0,   # ATTITUDE, AHRS2, VIBRATION
+    "SR0_EXTRA2":   10.0,   # VFR_HUD
+    "SR0_EXTRA3":   2.0,    # BATTERY_STATUS, WIND, AHRS3
+    "SR0_POSITION": 10.0,   # GLOBAL_POSITION_INT, LOCAL_POSITION_NED, GPS_RAW_INT
+    "SR0_RAW_SENS": 10.0,   # RAW_IMU, SCALED_IMU2/3
+    "SR0_EXT_STAT": 2.0,    # SYS_STATUS, MEMINFO, MISSION_CURRENT
+    "SR0_RC_CHAN":  4.0,    # RC_CHANNELS
+    "SR0_RAW_CTRL": 4.0,    # SERVO_OUTPUT_RAW
 }
 
 
