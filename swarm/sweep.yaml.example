@@ -1,0 +1,29 @@
+# Hyperparameter sweep config for swarm/sweep_train.py.
+#
+#   make sweep CONFIG=sweep.yaml
+#
+# CLI flags override values here. Paths are resolved relative to the
+# directory where you invoke `make` (typically the swarm/ dir).
+
+data_dir: output/
+primary_type: ATTITUDE
+cache_dir: .cache/biLSTM
+output_dir: sweep/
+
+# 1layer | 2layer | both
+model: both
+
+# One experiment is dispatched to each GPU; runs in batches of len(gpus).
+gpus: [0, 1, 2, 3, 4]
+
+scaler_fit_scope: train_all
+test_frac: 0.2
+val_frac: 0.2
+mixed_precision: true
+
+experiments:
+  - {window_size: 60,  stride: 1}
+  - {window_size: 80,  stride: 2}
+  - {window_size: 120, stride: 2}
+  - {window_size: 160, stride: 4}
+  - {window_size: 200, stride: 4}

@@ -12,7 +12,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -46,6 +46,10 @@ help:
 	@echo "  make analyze RUN=output/run_...      Report for a specific run."
 	@echo "  make analyze SQL='SELECT ...'        Ad-hoc query against view 'flight'."
 	@echo "  make analyze FORCE=1                 Rebuild flight.parquet."
+	@echo ""
+	@echo "  make sweep CONFIG=sweep.yaml"
+	@echo "      Parallel window-size/stride sweep across multiple GPUs."
+	@echo "      Cache-shares preprocessing once across all experiments."
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
@@ -232,6 +236,22 @@ sim-multi:
 	        $(_SIM_FLAGS) || exit 1; \
 	  done; \
 	} 2>&1 | tee "$$LOG"
+
+# Parallel hyperparameter sweep across multiple GPUs.
+#   make sweep CONFIG=sweep.yaml
+#   make sweep CONFIG=sweep.yaml SKIP_WARM=1   # cache already populated
+#
+# CONFIG defaults to swarm/sweep.yaml.example so `make sweep` after a fresh
+# checkout gives a clear "edit this file" error rather than NPE-ing on the
+# missing flag. The launcher itself does the GPU isolation via
+# CUDA_VISIBLE_DEVICES — no env wrangling needed here.
+sweep:
+	@CONFIG="$${CONFIG:-sweep.yaml}"; \
+	if [ ! -f "$$CONFIG" ]; then \
+	    echo "ERROR: $$CONFIG not found. Start from swarm/sweep.yaml.example."; exit 1; \
+	fi; \
+	echo "[make] sweep config: $$CONFIG"; \
+	$(PYTHON) sweep_train.py --config "$$CONFIG" $(if $(SKIP_WARM),--skip-warm)
 
 # Run RUNS sims, randomising attack window per iteration.
 # Each iteration draws START ∈ [START_MIN, START_MAX], duration ∈ [DUR_MIN, DUR_MAX],

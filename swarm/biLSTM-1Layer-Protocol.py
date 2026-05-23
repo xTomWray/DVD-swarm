@@ -2,7 +2,18 @@ import argparse
 import glob
 import json
 import os
+import sys
 from collections import Counter
+
+# Ensure the sibling module ``preprocessing_cache`` is importable even when
+# this file is invoked via an unusual sys.path (e.g. ``python -m`` or a
+# wrapped launcher). When run as ``python swarm/biLSTM-1Layer-Protocol.py``
+# the script's directory is already on sys.path, but this is defensive.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+
+import preprocessing_cache as pc  # noqa: E402  -- sibling module
 
 import joblib
 import numpy as np
@@ -508,6 +519,8 @@ def make_windows_from_scaled_rows(
                 "run_dir": row_data["run_dir"],
                 "drone_file": row_data["drone_file"],
                 "window_index": window_index,
+                "row_start_index": int(start_idx),
+                "row_end_index": int(end_idx),
                 "window_start_timestamp": float(timestamps[start_idx]),
                 "window_end_timestamp": float(timestamps[end_idx - 1]),
                 "run_label": row_data["run_label"],
@@ -637,6 +650,74 @@ def print_detection_metrics(split_name, y_true, y_prob, y_pred, metadata) -> Non
         print(f"  {name}: {count} ({pct:.2f}%)")
 
 
+def print_classification_breakdown(split_name, y_true, y_pred, metadata) -> None:
+    """Per-run and per-drone attack-class precision/recall/F1, sorted worst-first.
+
+    The global classification_report shows aggregate performance; this breakdown
+    surfaces *which* run or drone the model fails on. NaN F1 (e.g. a run with
+    only false positives) is sorted to the top so it is not lost.
+    """
+    y_true = np.asarray(y_true).reshape(-1)
+    y_pred = np.asarray(y_pred).reshape(-1)
+    if len(y_true) != len(metadata):
+        raise ValueError(
+            f"{split_name} metadata length ({len(metadata)}) does not match labels ({len(y_true)})"
+        )
+
+    by_run: dict[str, list[int]] = {}
+    by_drone: dict[str, list[int]] = {}
+    for i, m in enumerate(metadata):
+        run_dir = str(m["run_dir"])
+        by_run.setdefault(run_dir, []).append(i)
+        by_drone.setdefault(f"{run_dir}/{m['drone_file']}", []).append(i)
+
+    def _stats(idxs: list[int]) -> tuple[float, float, float, int]:
+        idx_arr = np.asarray(idxs, dtype=np.int64)
+        yt = y_true[idx_arr]
+        yp = y_pred[idx_arr]
+        tp = int(((yt == 1) & (yp == 1)).sum())
+        fp = int(((yt == 0) & (yp == 1)).sum())
+        fn = int(((yt == 1) & (yp == 0)).sum())
+        support = int((yt == 1).sum())
+        prec = tp / (tp + fp) if (tp + fp) else float("nan")
+        rec = tp / (tp + fn) if (tp + fn) else float("nan")
+        if tp and (tp + fp) and (tp + fn):
+            f1 = 2 * prec * rec / (prec + rec)
+        else:
+            f1 = float("nan")
+        return prec, rec, f1, support
+
+    def _sort_key(row: tuple[str, float, float, float, int]) -> tuple[int, float]:
+        _name, _p, _r, f1, _s = row
+        return (0, 0.0) if f1 != f1 else (1, f1)
+
+    print(f"\n── {split_name} per-run attack-class breakdown ───────────────────")
+    run_rows = [
+        (os.path.basename(r), *_stats(idxs))
+        for r, idxs in by_run.items()
+        if (np.asarray(y_true)[np.asarray(idxs, dtype=np.int64)] == 1).any()
+    ]
+    run_rows.sort(key=_sort_key)
+    print(f"  {'run':<48} {'prec':>8} {'rec':>8} {'F1':>8} {'support':>10}")
+    for name, p, r, f1, support in run_rows:
+        print(f"  {name:<48} {p:>8.4f} {r:>8.4f} {f1:>8.4f} {support:>10d}")
+    if not run_rows:
+        print("  (no runs with attack windows in this split)")
+
+    print(f"\n── {split_name} per-drone attack-class breakdown ─────────────────")
+    drone_rows = [
+        (f"{os.path.basename(os.path.dirname(k))}/{os.path.basename(k)}", *_stats(idxs))
+        for k, idxs in by_drone.items()
+        if (np.asarray(y_true)[np.asarray(idxs, dtype=np.int64)] == 1).any()
+    ]
+    drone_rows.sort(key=_sort_key)
+    print(f"  {'drone':<64} {'prec':>8} {'rec':>8} {'F1':>8} {'support':>10}")
+    for name, p, r, f1, support in drone_rows:
+        print(f"  {name:<64} {p:>8.4f} {r:>8.4f} {f1:>8.4f} {support:>10d}")
+    if not drone_rows:
+        print("  (no drones with attack windows in this split)")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -681,6 +762,19 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--cpu", action="store_true", help="Force CPU-only execution (hide all GPUs from TF)."
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        default=None,
+        help="If set, cache (or load) preprocessed + scaled rows under this directory. "
+        "Lets a hyperparameter sweep over --window-size/--stride skip the slow CSV→scaler stages.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Populate the cache (if --cache-dir is set) and exit before windowing/model fit. "
+        "Used by sweep launchers to warm the cache on CPU before launching GPU children.",
     )
     args = parser.parse_args()
 
@@ -837,6 +931,26 @@ if __name__ == "__main__":
         json.dump(manifest, f, indent=2)
     print(f"\n✓ Split manifest saved → {manifest_path}")
 
+    # ── Cache key (data fingerprint + preprocessing knobs) ────────────────────
+    cache_key = None
+    cache_subdir = None
+    if args.cache_dir:
+        cache_key = pc.compute_cache_key(
+            pc.CacheKeyInputs(
+                drone_files=tuple(sorted(drone_files)),
+                primary_type=args.primary_type,
+                scaler_fit_scope=args.scaler_fit_scope,
+                test_frac=args.test_frac,
+                val_frac=args.val_frac,
+                core_cols=tuple(core_cols),
+                split_seed=42,
+                script_identity="1layer",
+            )
+        )
+        cache_subdir = os.path.join(args.cache_dir, cache_key)
+
+    cache_hit = cache_subdir is not None and pc.cache_exists(cache_subdir)
+
     # ── Load/preprocess rows before fitting one train-only scaler ─────────────
     def _load_rows_split(files, name):
         row_items: list[dict[str, object]] = []
@@ -855,62 +969,125 @@ if __name__ == "__main__":
             print(f"  Loaded {len(out['features']):>7} {run_labels[run_dir]} rows <- {f}")
         return row_items
 
-    train_rows = _load_rows_split(train_files, "train")
-    val_rows = _load_rows_split(val_files, "val")
-    test_rows = _load_rows_split(test_files, "test")
+    if cache_hit:
+        print(f"[cache] hit {cache_key}  ({cache_subdir})")
+        cached = pc.load_cache(cache_subdir)
+        train_rows = cached["train_rows"]
+        val_rows = cached["val_rows"]
+        test_rows = cached["test_rows"]
+        feature_columns = cached["feature_columns"]
+        scaler_bundle = cached["scaler_bundle"]
+        scaler = scaler_bundle["scaler"]
+        fit_scope = scaler_bundle.get("fit_scope", "unknown")
+        pc.copy_artifacts_from_cache(
+            cache_subdir,
+            scaler_dst=scaler_path,
+            manifest_dst=manifest_path,
+            stage1_dst=None,
+        )
+        print(f"  scaler  → {scaler_path}")
+        print(f"  manifest→ {manifest_path}")
+        print(f"  features: {len(feature_columns)} columns; scaler fit scope: {fit_scope}")
 
-    if not train_rows:
-        raise RuntimeError("No training rows produced — check --data-dir and --primary-type.")
+        def _aligned_features(item):  # noqa: ARG001 -- unused on hit path
+            raise RuntimeError("_aligned_features should not be called on cache-hit path")
+    else:
+        if cache_subdir is not None:
+            print(f"[cache] miss {cache_key}; will populate at {cache_subdir}")
 
-    train_feature_sets = [set(item["features"].columns) for item in train_rows]
-    missing_core_by_file = [
-        (item["log_path"], sorted(set(core_cols) - set(item["features"].columns)))
-        for item in train_rows
-        if set(core_cols) - set(item["features"].columns)
-    ]
-    if missing_core_by_file:
-        details = "\n".join(f"  {path}: {missing}" for path, missing in missing_core_by_file[:10])
-        raise RuntimeError(f"Required core feature columns missing from training data:\n{details}")
+        train_rows = _load_rows_split(train_files, "train")
+        val_rows = _load_rows_split(val_files, "val")
+        test_rows = _load_rows_split(test_files, "test")
 
-    feature_columns = sorted(set().union(*train_feature_sets))
-    timestamp_like = [c for c in feature_columns if "timestamp" in c.lower() or c.startswith("time_")]
-    if timestamp_like:
-        raise RuntimeError(f"Timestamp-like columns leaked into features: {timestamp_like}")
+        if not train_rows:
+            raise RuntimeError("No training rows produced — check --data-dir and --primary-type.")
 
-    def _aligned_features(item):
-        frame = item["features"]
-        missing_core = sorted(set(core_cols) - set(frame.columns))
-        if missing_core:
-            raise RuntimeError(f"{item['log_path']} is missing core feature columns {missing_core}")
-        return frame.reindex(columns=feature_columns, fill_value=0).fillna(0)
+        train_feature_sets = [set(item["features"].columns) for item in train_rows]
+        missing_core_by_file = [
+            (item["log_path"], sorted(set(core_cols) - set(item["features"].columns)))
+            for item in train_rows
+            if set(core_cols) - set(item["features"].columns)
+        ]
+        if missing_core_by_file:
+            details = "\n".join(
+                f"  {path}: {missing}" for path, missing in missing_core_by_file[:10]
+            )
+            raise RuntimeError(f"Required core feature columns missing from training data:\n{details}")
 
-    fit_rows = train_rows
-    fit_scope = "train_rows_only"
-    if args.scaler_fit_scope == "train_benign":
-        fit_rows = [item for item in train_rows if item["run_label"] == "benign"]
-        fit_scope = "train_benign_rows_only"
-        if not fit_rows:
-            raise RuntimeError("--scaler-fit-scope train_benign requested, but no benign train rows exist.")
+        feature_columns = sorted(set().union(*train_feature_sets))
+        timestamp_like = [
+            c for c in feature_columns if "timestamp" in c.lower() or c.startswith("time_")
+        ]
+        if timestamp_like:
+            raise RuntimeError(f"Timestamp-like columns leaked into features: {timestamp_like}")
 
-    scaler = StandardScaler()
-    scaler.fit(pd.concat([_aligned_features(item) for item in fit_rows], ignore_index=True).values)
-    joblib.dump(
-        {
-            "scaler": scaler,
-            "feature_columns": feature_columns,
-            "primary_type": args.primary_type,
-            "window_size": args.window_size,
-            "stride": args.stride,
-            "fit_scope": fit_scope,
-            "created_by_script": os.path.basename(__file__),
-            "feature_count": len(feature_columns),
-            "model_output": model_name,
-            "split_manifest_path": manifest_path,
-        },
-        scaler_path,
-    )
-    print(f"✓ Scaler bundle saved → {scaler_path}")
-    print(f"Scaler fit scope: {fit_scope}; feature_count={len(feature_columns)}")
+        def _aligned_features(item):
+            frame = item["features"]
+            missing_core = sorted(set(core_cols) - set(frame.columns))
+            if missing_core:
+                raise RuntimeError(
+                    f"{item['log_path']} is missing core feature columns {missing_core}"
+                )
+            return frame.reindex(columns=feature_columns, fill_value=0).fillna(0)
+
+        fit_rows = train_rows
+        fit_scope = "train_rows_only"
+        if args.scaler_fit_scope == "train_benign":
+            fit_rows = [item for item in train_rows if item["run_label"] == "benign"]
+            fit_scope = "train_benign_rows_only"
+            if not fit_rows:
+                raise RuntimeError(
+                    "--scaler-fit-scope train_benign requested, but no benign train rows exist."
+                )
+
+        scaler = StandardScaler()
+        scaler.fit(
+            pd.concat([_aligned_features(item) for item in fit_rows], ignore_index=True).values
+        )
+        joblib.dump(
+            {
+                "scaler": scaler,
+                "feature_columns": feature_columns,
+                "primary_type": args.primary_type,
+                "window_size": args.window_size,
+                "stride": args.stride,
+                "fit_scope": fit_scope,
+                "created_by_script": os.path.basename(__file__),
+                "feature_count": len(feature_columns),
+                "model_output": model_name,
+                "split_manifest_path": manifest_path,
+            },
+            scaler_path,
+        )
+        print(f"✓ Scaler bundle saved → {scaler_path}")
+        print(f"Scaler fit scope: {fit_scope}; feature_count={len(feature_columns)}")
+
+        # Pre-scale every row once — caching captures the scaled tensor so
+        # window-sweep children skip both _aligned_features and scaler.transform.
+        for items in (train_rows, val_rows, test_rows):
+            for item in items:
+                aligned = _aligned_features(item)
+                item["scaled_features"] = scaler.transform(aligned.values).astype(np.float32)
+                item.pop("features", None)
+
+        if cache_subdir is not None:
+            print(f"[cache] populating {cache_subdir}")
+            pc.write_cache(
+                cache_subdir,
+                key=cache_key,
+                train_rows=train_rows,
+                val_rows=val_rows,
+                test_rows=test_rows,
+                feature_columns=feature_columns,
+                scaler_src=scaler_path,
+                manifest_src=manifest_path,
+                stage1_src=None,
+            )
+            print(f"[cache] populated {cache_subdir}")
+
+    if args.dry_run:
+        print("\n--dry-run set; skipping windowing + model fit.")
+        sys.exit(0)
 
     def _load_split(row_items, name):
         windows: list[np.ndarray] = []
@@ -919,11 +1096,9 @@ if __name__ == "__main__":
         n_sims = 0
         print(f"\n── Windowing {name} rows ─────────────────────────────────────────")
         for item in row_items:
-            aligned = _aligned_features(item)
-            scaled = scaler.transform(aligned.values)
             out = make_windows_from_scaled_rows(
                 item,
-                scaled,
+                item["scaled_features"],
                 args.window_size,
                 args.stride,
             )
@@ -1079,6 +1254,7 @@ if __name__ == "__main__":
 Actual Benign    {cm[0][0]:<6}           {cm[0][1]:<6}   (False Alarms)
 Actual Attack    {cm[1][0]:<6}           {cm[1][1]:<6}   (Missed Attacks)
 """)
+    print_classification_breakdown("Val", y_val, y_pred, all_val_metadata)
     print_detection_metrics("Val", y_val, y_pred_prob, y_pred, all_val_metadata)
 
     # ── Held-out test evaluation (final, untouched until now) ─────────────────
@@ -1095,6 +1271,7 @@ Actual Attack    {cm[1][0]:<6}           {cm[1][1]:<6}   (Missed Attacks)
 Actual Benign    {cm_t[0][0]:<6}           {cm_t[0][1]:<6}   (False Alarms)
 Actual Attack    {cm_t[1][0]:<6}           {cm_t[1][1]:<6}   (Missed Attacks)
 """)
+        print_classification_breakdown("Test", y_test, y_test_pred, all_test_metadata)
         print_detection_metrics("Test", y_test, y_test_prob, y_test_pred, all_test_metadata)
         # Per-run breakdown of where the test drones came from, so a bad
         # test score can be traced back to which run(s) the model misread.
