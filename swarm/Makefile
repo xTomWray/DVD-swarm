@@ -53,7 +53,7 @@ help:
 	@echo ""
 	@echo "  make audit [DATA=<dir>] [PRIMARY=<msg>] [WINDOW=<n>] [STRIDE=<n>]"
 	@echo "      Row/window counts + sufficiency warnings across a data dir."
-	@echo "      Defaults: DATA=training-data/all PRIMARY=ATTITUDE WINDOW=80 STRIDE=2"
+	@echo "      Defaults: DATA=training-data PRIMARY=ATTITUDE WINDOW=80 STRIDE=2"
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
@@ -364,11 +364,11 @@ analyze:
 # counts, per-shape totals, and sufficiency warnings (insufficient runs,
 # shape/class mismatches, row-balance skew). Never touches flight.parquet.
 #   make audit
-#   make audit DATA=output/                       # different data dir
-#   make audit DATA=training-data/all WINDOW=120 STRIDE=4   # what-if sweep
+#   make audit DATA=output/                          # different data dir
+#   make audit DATA=training-data WINDOW=120 STRIDE=4   # what-if sweep
 audit:
 	@cd .. && $(PYTHON) -m swarm.dataset.audit \
-	    --data-dir $(if $(DATA),$(DATA),training-data/all) \
+	    --data-dir $(if $(DATA),$(DATA),training-data) \
 	    --primary-type $(if $(PRIMARY),$(PRIMARY),ATTITUDE) \
 	    --window-size $(if $(WINDOW),$(WINDOW),80) \
 	    --stride $(if $(STRIDE),$(STRIDE),2)

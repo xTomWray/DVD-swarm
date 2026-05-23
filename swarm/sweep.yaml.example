@@ -4,10 +4,11 @@
 #
 # CLI flags override values here. Paths are resolved relative to the
 # directory where you invoke `make` — `make sweep` runs from swarm/, so
-# `../output/` points at the repo-root output/ directory where DVD-swarm
-# writes per-drone CSVs.
+# `../training-data/` points at the repo-root training-data/ tree.
+# The trainer globs `**/csv/drone_*.csv` recursively, so attack/ and
+# benign/ subdirs are both picked up automatically.
 
-data_dir: ../output/
+data_dir: ../training-data/
 primary_type: ATTITUDE
 cache_dir: .cache/biLSTM
 output_dir: sweep/

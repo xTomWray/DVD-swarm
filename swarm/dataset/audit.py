@@ -166,9 +166,12 @@ def audit_dataset(
     and ``output/``).
     """
     data_dir = data_dir.resolve()
+    # Recursive: a "run dir" is any directory named run_* that has a
+    # metadata.json next to it. This naturally picks up both flat layouts
+    # (data_dir/run_*) and nested ones (data_dir/{attack,benign}/run_*).
     run_dirs = sorted(
-        p for p in data_dir.iterdir()
-        if p.name.startswith("run_") and (p.is_dir() or p.is_symlink())
+        p for p in data_dir.rglob("run_*")
+        if p.is_dir() and (p / "metadata.json").exists()
     )
 
     drone_files = 0
