@@ -12,7 +12,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep audit
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -50,6 +50,10 @@ help:
 	@echo "  make sweep CONFIG=sweep.yaml"
 	@echo "      Parallel window-size/stride sweep across multiple GPUs."
 	@echo "      Cache-shares preprocessing once across all experiments."
+	@echo ""
+	@echo "  make audit [DATA=<dir>] [PRIMARY=<msg>] [WINDOW=<n>] [STRIDE=<n>]"
+	@echo "      Row/window counts + sufficiency warnings across a data dir."
+	@echo "      Defaults: DATA=training-data/all PRIMARY=ATTITUDE WINDOW=80 STRIDE=2"
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
@@ -355,6 +359,19 @@ analyze:
 	    $(if $(RUN),--run $(RUN)) \
 	    $(if $(FORCE),--force) \
 	    $(if $(SQL),--sql "$(SQL)")
+
+# Read-only structural audit of a dataset directory: per-class row + window
+# counts, per-shape totals, and sufficiency warnings (insufficient runs,
+# shape/class mismatches, row-balance skew). Never touches flight.parquet.
+#   make audit
+#   make audit DATA=output/                       # different data dir
+#   make audit DATA=training-data/all WINDOW=120 STRIDE=4   # what-if sweep
+audit:
+	@cd .. && $(PYTHON) -m swarm.dataset.audit \
+	    --data-dir $(if $(DATA),$(DATA),training-data/all) \
+	    --primary-type $(if $(PRIMARY),$(PRIMARY),ATTITUDE) \
+	    --window-size $(if $(WINDOW),$(WINDOW),80) \
+	    --stride $(if $(STRIDE),$(STRIDE),2)
 
 # List archives newest first with file sizes. Shows both legacy .tar.gz
 # and new .tar.zst.
