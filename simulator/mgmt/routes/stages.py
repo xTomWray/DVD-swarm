@@ -72,14 +72,14 @@ def stage1():
             "Tools/autotest/sim_vehicle.py -v ArduCopter --add-param-file drone.parm "
             "--custom-location 37.241861,-115.796917,0,340 -f gazebo-iris "
             "--no-rebuild --no-mavproxy --sim-address=10.13.0.5 "
-            "-A '--serial0=uart:/dev/ttyACM0:57600'"
+            "-A '--serial0=uart:/dev/ttyACM0:921600'"
         )
     else:
         command = (
             "Tools/autotest/sim_vehicle.py -v ArduCopter --add-param-file drone.parm "
             "--custom-location 37.241861,-115.796917,0,340 -f quad "
             "--no-rebuild --no-mavproxy "
-            "-A '--serial0=uart:/dev/ttyACM0:57600'"
+            "-A '--serial0=uart:/dev/ttyACM0:921600'"
         )
 
     logger.info("Executing (detached): %s", command)
@@ -90,7 +90,7 @@ def stage1():
     logger.info("Starting MAVLink Router on Companion…")
     data = {
         "serial_device": "/dev/ttyUSB0",
-        "baud_rate": "57600",
+        "baud_rate": "921600",
         "mavlink_version": "2",
         "enable_udp_server": False,
         "udp_server_port": "14550",
