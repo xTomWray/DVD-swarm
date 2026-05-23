@@ -292,6 +292,13 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
     # patch reads MISSION_REQUEST_TIMEOUT env var (default 30s) with retries.
     _arm_patch = str(_REPO_ROOT / "ground-control-station/stages/arm-and-takeoff.py")
     _autopilot_patch = str(_REPO_ROOT / "swarm/gcs_patches/autopilot-flight.py")
+    # /init runs MAVProxy on container start. Bind-mounting so the
+    # --streamrate=-1 flag (and any future tweaks) can roll out via
+    # `git pull` + restart instead of an image rebuild. Without
+    # --streamrate=-1, MAVProxy silently caps every stream at the same
+    # downgraded rate, overriding the SR0_* params arm-and-takeoff.py
+    # injects.
+    _init_patch = str(_REPO_ROOT / "ground-control-station/init")
     return {
         "image": IMAGES["ground-control-station"],
         "container_name": f"ground-control-station-lite-{n}",
@@ -319,6 +326,7 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
             f"{_missions}:/opt/gcs/missions:ro",
             f"{_arm_patch}:/opt/gcs/stages/arm-and-takeoff.py:ro",
             f"{_autopilot_patch}:/opt/gcs/stages/autopilot-flight.py:ro",
+            f"{_init_patch}:/init:ro",
         ],
         "networks": {
             f"dvd-net-{n}": {"ipv4_address": GCS_IP_TEMPLATE.format(n=n)},
