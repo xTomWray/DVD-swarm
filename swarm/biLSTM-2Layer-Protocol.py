@@ -363,8 +363,10 @@ def load_window_normalize_log(
         raise ValueError(f"run_label must be 'benign' or 'attack', got {run_label!r}")
 
     # Prefer flight.parquet over the per-drone CSV — predicate pushdown
-    # filters by drone_id + mav_packet_type at read time so we only touch
-    # the relevant rows. 10-100x faster than reading every CSV in full.
+    # filters by drone_id + mav_packet_type at read time and column
+    # projection limits the read to the ~8 cols we actually use (out of
+    # ~1100 in the union schema). 100-500x faster than reading every
+    # row × every column then coercing.
     run_dir = os.path.dirname(os.path.dirname(log_path))
     pq_path = os.path.join(run_dir, "flight.parquet")
     used_parquet = False
@@ -373,25 +375,47 @@ def load_window_normalize_log(
             drone_id = int(
                 os.path.basename(log_path).replace("drone_", "").replace(".csv", "")
             )
-            df = pd.read_parquet(
-                pq_path,
-                filters=[
-                    ("drone_id", "==", drone_id),
-                    ("mav_packet_type", "==", primary_type),
-                ],
-            )
+            # Only the columns we actually need downstream: timestamp for
+            # sort, attack_type for the run-level filter, and core_cols for
+            # feature engineering. Everything else is union-schema noise.
+            wanted_cols = ["timestamp", "attack_type", *core_cols]
+            try:
+                df = pd.read_parquet(
+                    pq_path,
+                    filters=[
+                        ("drone_id", "==", drone_id),
+                        ("mav_packet_type", "==", primary_type),
+                    ],
+                    columns=wanted_cols,
+                )
+            except (KeyError, ValueError):
+                # Some requested column missing from the parquet schema —
+                # fall back to reading everything (rare; covered for safety).
+                df = pd.read_parquet(
+                    pq_path,
+                    filters=[
+                        ("drone_id", "==", drone_id),
+                        ("mav_packet_type", "==", primary_type),
+                    ],
+                )
             # analyze.py writes parquet with all_varchar=true (handles the
-            # mixed-type checksum column). Coerce numerics back here.
-            keep_str = {"mav_packet_type", "attack_type"}
+            # mixed-type checksum column). Coerce numerics back here —
+            # tiny loop now that we only have ~8 columns.
             for col in df.columns:
-                if col not in keep_str:
+                if col != "attack_type":
                     df[col] = pd.to_numeric(df[col], errors="coerce")
             used_parquet = True
         except Exception as exc:
             print(f"  parquet read failed for {pq_path} ({exc!s}); falling back to CSV")
 
     if not used_parquet:
-        df = pd.read_csv(log_path, low_memory=False)
+        # mav_packet_type is needed for the row filter, then dropped.
+        wanted_cols = ["mav_packet_type", "timestamp", "attack_type", *core_cols]
+        try:
+            df = pd.read_csv(log_path, low_memory=False, usecols=wanted_cols)
+        except (ValueError, KeyError):
+            # Older runs may have a narrower CSV header — fall back to full read.
+            df = pd.read_csv(log_path, low_memory=False)
         df = df[df["mav_packet_type"] == primary_type].copy()
 
     # Apply the per-run filter rule before windowing.
