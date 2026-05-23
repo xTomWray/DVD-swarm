@@ -15,13 +15,13 @@ if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
 import preprocessing_cache as pc  # noqa: E402  -- sibling module
+from training_split import run_level_three_way_split  # noqa: E402  -- sibling module
 
 import joblib
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from sklearn.metrics import classification_report, confusion_matrix, precision_recall_curve
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import shuffle
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
@@ -802,6 +802,12 @@ if __name__ == "__main__":
         help="Populate the cache (if --cache-dir is set) and exit before windowing/model fit. "
         "Used by sweep launchers to warm the cache on CPU before launching GPU children.",
     )
+    parser.add_argument(
+        "--allow-imbalanced",
+        action="store_true",
+        help="Bypass the hard-fail when either class has <3 runs. For experimentation only — "
+        "val/test may end up class-empty, which makes threshold tuning meaningless.",
+    )
     args = parser.parse_args()
 
     if args.cpu:
@@ -880,31 +886,21 @@ if __name__ == "__main__":
             f"Only {len(run_paths)} run(s) found; need at least 3 for train/val/test split."
         )
 
-    def _safe_run_split(items, test_size, label):
-        strat = [run_labels[r] for r in items]
-        counts = Counter(strat)
-        use_stratify = len(counts) > 1 and min(counts.values()) >= 2
-        try:
-            return train_test_split(
-                items,
-                test_size=test_size,
-                random_state=42,
-                stratify=strat if use_stratify else None,
-            )
-        except ValueError as exc:
-            print(f"  WARN: stratified {label} split failed ({exc}); falling back to unstratified.")
-            return train_test_split(items, test_size=test_size, random_state=42)
-
-    trainval_runs, test_runs = _safe_run_split(run_paths, args.test_frac, "test")
-    train_runs, val_runs = _safe_run_split(trainval_runs, args.val_frac, "val")
+    split = run_level_three_way_split(
+        run_paths,
+        run_labels,
+        test_frac=args.test_frac,
+        val_frac=args.val_frac,
+        seed=42,
+        allow_imbalanced=args.allow_imbalanced,
+    )
+    train_runs, val_runs, test_runs = split.train_runs, split.val_runs, split.test_runs
+    for note in split.notes:
+        print(f"[split] {note}")
 
     train_files = [f for r in sorted(train_runs) for f in runs[r]]
     val_files = [f for r in sorted(val_runs) for f in runs[r]]
     test_files = [f for r in sorted(test_runs) for f in runs[r]]
-
-    train_set, val_set, test_set = set(train_runs), set(val_runs), set(test_runs)
-    if train_set & val_set or train_set & test_set or val_set & test_set:
-        raise AssertionError("Run-level split overlap detected")
 
     def _class_summary(run_items):
         c = Counter(run_labels[r] for r in run_items)
