@@ -160,6 +160,17 @@ def _parse_args() -> argparse.Namespace:
              "routers time to forward HEARTBEATs. 0 (default) auto-sizes to "
              "max(15, N/3).",
     )
+    run_p.add_argument(
+        "--stage-stagger",
+        type=float,
+        default=0.5,
+        help="Seconds to sleep between consecutive POST submissions within "
+             "each stage. Spreads simultaneous host-CPU bursts (SITL load, "
+             "MAVProxy command processing, mission upload) across time so "
+             "the scheduler doesn't pile work onto the same cores. "
+             "N×<stagger> is added per stage — 35 × 0.5s = 17.5s per stage "
+             "(default: 0.5).",
+    )
 
     return parser.parse_args()
 
@@ -389,23 +400,33 @@ def _parallel_post(
     *,
     max_workers: int,
     timeout: float,
+    stagger: float = 0.0,
 ) -> set[int]:
     """POST /stage<stage> to every id in parallel; return the set that succeeded.
 
     Logs each failure but does not raise — the caller decides what to do with
     the survivor set (continue with partial swarm, or abort if empty).
+
+    ``stagger``: seconds to sleep between consecutive submissions. The pool
+    still runs ``max_workers`` requests in parallel — stagger only spreads
+    *submission times*, smoothing the burst of host work that 35 simultaneous
+    POSTs would otherwise trigger.
     """
     targets = sorted(set(ids))
     if not targets:
         return set()
     workers = max(1, min(len(targets), max_workers))
     log.info(
-        "POST /stage%d to %d drone(s) (concurrency=%d, http_timeout=%.0fs)…",
-        stage, len(targets), workers, timeout,
+        "POST /stage%d to %d drone(s) (concurrency=%d, http_timeout=%.0fs, stagger=%.2fs)…",
+        stage, len(targets), workers, timeout, stagger,
     )
     ok: set[int] = set()
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_post_stage, n, stage, timeout): n for n in targets}
+        futures: dict = {}
+        for i, n in enumerate(targets):
+            if stagger > 0 and i > 0:
+                time.sleep(stagger)
+            futures[pool.submit(_post_stage, n, stage, timeout)] = n
         for fut in as_completed(futures):
             n = futures[fut]
             try:
@@ -484,6 +505,7 @@ def _wait_for_swarm_ready(
     *,
     allow_partial: bool = False,
     stage1_concurrency: int = 16,
+    stage_stagger: float = 0.0,
 ) -> set[int]:
     """Bring the swarm to a state where /stage2 (arm + takeoff) can be POSTed.
 
@@ -539,10 +561,17 @@ def _wait_for_swarm_ready(
     )
 
     workers = max(1, min(len(ready), stage1_concurrency))
-    log.info("Triggering Stage 1 on %d drone(s) (%d parallel)…", len(ready), workers)
+    log.info(
+        "Triggering Stage 1 on %d drone(s) (%d parallel, stagger=%.2fs)…",
+        len(ready), workers, stage_stagger,
+    )
     staged: set[int] = set()
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_trigger_stage1, n): n for n in sorted(ready)}
+        futures: dict = {}
+        for i, n in enumerate(sorted(ready)):
+            if stage_stagger > 0 and i > 0:
+                time.sleep(stage_stagger)
+            futures[pool.submit(_trigger_stage1, n)] = n
         for fut in as_completed(futures):
             n = futures[fut]
             try:
@@ -691,6 +720,7 @@ def main() -> int:
             total_timeout=readiness_total,
             allow_partial=not args.strict,
             stage1_concurrency=args.stage1_concurrency,
+            stage_stagger=args.stage_stagger,
         )
         if not ready_drones:
             raise RuntimeError("No drones reached stage1 readiness — aborting.")
@@ -721,6 +751,7 @@ def main() -> int:
             drone_ids, stage=2,
             max_workers=args.gcs_concurrency,
             timeout=args.stage_http_timeout,
+            stagger=args.stage_stagger,
         )
 
         # Phase 7b: POST /stage3 (mission upload + AUTO) to drones that
@@ -731,6 +762,7 @@ def main() -> int:
             sorted(armed), stage=3,
             max_workers=args.gcs_concurrency,
             timeout=args.stage_http_timeout,
+            stagger=args.stage_stagger,
         )
         log.info("Drones at AUTO: %d/%d", len(auto), len(drone_ids))
 

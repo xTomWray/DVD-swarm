@@ -19,18 +19,25 @@ Memory budget (with GCS, default limits):
 
 CPU caps (per service, fractional cores). These are upper bounds (Docker
 `cpus:` = hard CFS quota), sized for worst-case bursts (SITL firmware load,
-GCS arm/takeoff). Steady-state usage is much lower; auto-sizing below uses
-the steady-state estimate, not the cap.
+GCS arm/takeoff). Lite-mode defaults assume no QGroundControl GUI and no
+Gazebo (ArduPilot built-in dynamics). Steady-state usage is much lower;
+auto-sizing below uses the steady-state estimate, not the cap.
   flight-controller : 1.00   (steady ~0.25)
   companion-computer: 0.50   (steady ~0.05)
-  ground-control-stn: 0.80   (steady ~0.10)
-  simulator         : 0.20   (steady ~0.05)
+  ground-control-stn: 0.30   (steady ~0.10) — lite mode, MAVProxy only
+  simulator         : 0.10   (steady ~0.05) — lite mode, no Gazebo
   ──────────────────────────────────────────
-  cap sum           : 2.50 with GCS,  1.70 without
+  cap sum           : 1.90 with GCS,  1.60 without
   steady sum        : 0.50 with GCS,  0.35 without
 
   64-CPU host → N≈120 with GCS by steady-state (cap-oversubscribed but fine)
   16-CPU host → N≈24  with GCS
+
+CPU pinning: each instance is assigned a disjoint `cpuset:` band so the
+Linux scheduler can't pile burst-time work from multiple drones onto the
+same physical core. When usable_cores < instance_count, instances share
+overlapping bands (still bounded — better than free-for-all). This is the
+single biggest contention fix at N>=30.
 
 Per-service env overrides (no code changes needed):
   DVD_MEM_<service>= and DVD_CPU_<service>= (service name uppercased,
@@ -149,8 +156,12 @@ DEFAULT_MEM: dict[str, str] = {
 DEFAULT_CPU: dict[str, str] = {
     "flight-controller":      "1.00",   # full core for SITL startup/physics burst
     "companion-computer":     "0.50",   # mavlink-router + Flask under attack load
-    "ground-control-station": "0.80",   # stage scripts hammer mavlink at arm/takeoff
-    "simulator":              "0.20",   # mgmt console only
+    # Lite-mode (no QGroundControl GUI): just MAVProxy + stage scripts.
+    # Drops total per-instance burst cap from 2.50 → 1.90 — meaningful headroom
+    # at N>=30. Bump via DVD_CPU_GROUND_CONTROL_STATION if you ever revive QGC.
+    "ground-control-station": "0.30",
+    # Lite-mode simulator: ArduPilot's built-in dynamics, no Gazebo, no GUI.
+    "simulator":              "0.10",
 }
 
 # OS + Docker daemon overhead reserved from total host RAM
@@ -169,25 +180,70 @@ _CPU_PER_INSTANCE_NO_GCS   = 0.35
 _CPU_PER_INSTANCE_WITH_GCS = 0.50
 
 
-def _resource_limits(service: str) -> dict[str, str]:
-    """Return mem_limit, memswap_limit, and cpus keys for a service.
+def _cpuset_for_instance(n: int, total_n: int, host_cpus: int) -> str | None:
+    """Return a ``cpuset:`` range string for instance n, or None to skip.
+
+    Each instance gets a disjoint band of host cores. When usable_cores
+    < total_n, bands overlap (round-robin) but are still bounded — fewer
+    surprises than free-for-all CFS scheduling.
+
+    host_cpus <= 0 (unknown) → return None and let docker schedule freely.
+    """
+    if host_cpus <= 0 or total_n <= 0:
+        return None
+    os_overhead = int(_OS_CPU_OVERHEAD)
+    usable = max(1, host_cpus - os_overhead)
+    cores_per_instance = max(1, usable // total_n)
+    # Distribute bands sequentially, wrapping when total_n*cores_per > usable.
+    band_start = os_overhead + ((n - 1) * cores_per_instance) % usable
+    band_end = band_start + cores_per_instance - 1
+    # Clamp the upper bound to the last usable core.
+    last_core = host_cpus - 1
+    if band_end > last_core:
+        band_end = last_core
+    return f"{band_start}-{band_end}" if band_end > band_start else f"{band_start}"
+
+
+def _resource_limits(
+    service: str,
+    *,
+    n: int | None = None,
+    total_n: int | None = None,
+    host_cpus: int | None = None,
+) -> dict[str, str]:
+    """Return mem_limit, memswap_limit, cpus, and optionally cpuset for a service.
 
     Env-var overrides per service let operators dial caps without editing
     code:
       DVD_MEM_FLIGHT_CONTROLLER=384m make generate INSTANCES=80
       DVD_CPU_GROUND_CONTROL_STATION=0.30 make generate INSTANCES=60
+
+    When all three of n, total_n, host_cpus are supplied a cpuset band is
+    computed and added. Callers that haven't been updated (or callers that
+    legitimately don't want pinning) simply omit them.
     """
     upper = service.upper().replace("-", "_")
     mem = os.environ.get(f"DVD_MEM_{upper}", DEFAULT_MEM[service])
     cpu = os.environ.get(f"DVD_CPU_{upper}", DEFAULT_CPU[service])
-    return {
+    out: dict[str, str] = {
         "mem_limit":     mem,
         "memswap_limit": mem,   # disable swap
         "cpus":          cpu,
     }
+    if n is not None and total_n is not None and host_cpus is not None:
+        cpuset = _cpuset_for_instance(n, total_n, host_cpus)
+        if cpuset is not None:
+            out["cpuset"] = cpuset
+    return out
 
 
-def flight_controller_service(n: int, raw_dir: Path) -> dict[str, Any]:
+def flight_controller_service(
+    n: int,
+    raw_dir: Path,
+    *,
+    total_n: int | None = None,
+    host_cpus: int | None = None,
+) -> dict[str, Any]:
     """Build the flight-controller-lite service definition for instance N."""
     logs_path = str((raw_dir / f"instance-{n}").resolve())
     _parm = str(_REPO_ROOT / "flight-controller/drone.parm")
@@ -209,7 +265,9 @@ def flight_controller_service(n: int, raw_dir: Path) -> dict[str, Any]:
             f"dvd-net-{n}": {"ipv4_address": FC_IP_TEMPLATE.format(n=n)},
         },
         "restart": "unless-stopped",
-        **_resource_limits("flight-controller"),
+        **_resource_limits(
+            "flight-controller", n=n, total_n=total_n, host_cpus=host_cpus
+        ),
     }
 
 
@@ -231,7 +289,13 @@ def resolve_waypoints(n: int, waypoints_dir: Path | None) -> str | None:
     return None
 
 
-def companion_computer_service(n: int, waypoints_dir: Path | None) -> dict[str, Any]:
+def companion_computer_service(
+    n: int,
+    waypoints_dir: Path | None,
+    *,
+    total_n: int | None = None,
+    host_cpus: int | None = None,
+) -> dict[str, Any]:
     """Build the companion-computer-lite service definition for instance N.
 
     Mounts a waypoints file at /missions/waypoints.txt if one is found under
@@ -272,11 +336,19 @@ def companion_computer_service(n: int, waypoints_dir: Path | None) -> dict[str, 
             f"dvd-net-{n}": {"ipv4_address": CC_IP_TEMPLATE.format(n=n)},
         },
         "restart": "unless-stopped",
-        **_resource_limits("companion-computer"),
+        **_resource_limits(
+            "companion-computer", n=n, total_n=total_n, host_cpus=host_cpus
+        ),
     }
 
 
-def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
+def ground_control_station_service(
+    n: int,
+    raw_dir: Path,
+    *,
+    total_n: int | None = None,
+    host_cpus: int | None = None,
+) -> dict[str, Any]:
     """Build the ground-control-station-lite service definition for instance N.
 
     X11 display, GPU device, and WiFi are all stripped for headless operation.
@@ -287,10 +359,13 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
     # Single-file overlays for the two stage scripts that differ from the
     # image-baked copies. A directory mount can't be overlaid with a file
     # mount on Docker Desktop WSL2, so we mount each file individually.
-    # arm-and-takeoff.py: image version targets ~2.5m; repo version targets 10m.
+    # arm-and-takeoff.py: image version is unbounded on EKF wait + has no
+    # per-step timing. Repo patch bounds EKF wait (EKF_WAIT_TIMEOUT) and
+    # emits [stage2 instance=N] step= timing lines so contention is visible.
     # autopilot-flight.py: image version has 5s MISSION_REQUEST timeout; repo
-    # patch reads MISSION_REQUEST_TIMEOUT env var (default 30s) with retries.
-    _arm_patch = str(_REPO_ROOT / "ground-control-station/stages/arm-and-takeoff.py")
+    # patch reads MISSION_REQUEST_TIMEOUT env var (default 30s) with retries
+    # and emits matching [stage3 instance=N] step= timing lines.
+    _arm_patch = str(_REPO_ROOT / "swarm/gcs_patches/arm-and-takeoff.py")
     _autopilot_patch = str(_REPO_ROOT / "swarm/gcs_patches/autopilot-flight.py")
     # /init runs MAVProxy on container start. Bind-mounting so the
     # --streamrate=-1 flag (and any future tweaks) can roll out via
@@ -316,6 +391,7 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
             f"MISSION_REQUEST_TIMEOUT=${{MISSION_REQUEST_TIMEOUT:-30}}",
             f"MISSION_ACK_TIMEOUT=${{MISSION_ACK_TIMEOUT:-30}}",
             f"MISSION_UPLOAD_RETRIES=${{MISSION_UPLOAD_RETRIES:-3}}",
+            f"EKF_WAIT_TIMEOUT=${{EKF_WAIT_TIMEOUT:-600}}",
         ],
         "volumes": [
             # Qt requires /etc/machine-id — available on any Linux host
@@ -332,11 +408,18 @@ def ground_control_station_service(n: int, raw_dir: Path) -> dict[str, Any]:
             f"dvd-net-{n}": {"ipv4_address": GCS_IP_TEMPLATE.format(n=n)},
         },
         "restart": "unless-stopped",
-        **_resource_limits("ground-control-station"),
+        **_resource_limits(
+            "ground-control-station", n=n, total_n=total_n, host_cpus=host_cpus
+        ),
     }
 
 
-def simulator_service(n: int) -> dict[str, Any]:
+def simulator_service(
+    n: int,
+    *,
+    total_n: int | None = None,
+    host_cpus: int | None = None,
+) -> dict[str, Any]:
     """Build the simulator-lite service definition for instance N."""
     cc_url = f"http://{CC_IP_TEMPLATE.format(n=n)}:3000"
     return {
@@ -368,21 +451,35 @@ def simulator_service(n: int) -> dict[str, Any]:
             f"dvd-net-{n}": {"ipv4_address": SIM_IP_TEMPLATE.format(n=n)},
         },
         "restart": "unless-stopped",
-        **_resource_limits("simulator"),
+        **_resource_limits(
+            "simulator", n=n, total_n=total_n, host_cpus=host_cpus
+        ),
     }
 
 
 def instance_services(
-    n: int, *, include_gcs: bool, waypoints_dir: Path | None, raw_dir: Path
+    n: int,
+    *,
+    include_gcs: bool,
+    waypoints_dir: Path | None,
+    raw_dir: Path,
+    total_n: int | None = None,
+    host_cpus: int | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return service definitions for instance N."""
     services: dict[str, dict[str, Any]] = {
-        f"flight-controller-lite-{n}": flight_controller_service(n, raw_dir),
-        f"companion-computer-lite-{n}": companion_computer_service(n, waypoints_dir),
-        f"simulator-lite-{n}": simulator_service(n),
+        f"flight-controller-lite-{n}": flight_controller_service(
+            n, raw_dir, total_n=total_n, host_cpus=host_cpus
+        ),
+        f"companion-computer-lite-{n}": companion_computer_service(
+            n, waypoints_dir, total_n=total_n, host_cpus=host_cpus
+        ),
+        f"simulator-lite-{n}": simulator_service(n, total_n=total_n, host_cpus=host_cpus),
     }
     if include_gcs:
-        services[f"ground-control-station-lite-{n}"] = ground_control_station_service(n, raw_dir)
+        services[f"ground-control-station-lite-{n}"] = ground_control_station_service(
+            n, raw_dir, total_n=total_n, host_cpus=host_cpus
+        )
     return services
 
 
@@ -474,15 +571,26 @@ def generate(
     include_gcs: bool,
     waypoints_dir: Path | None,
     raw_dir: Path,
+    host_cpus: int | None = None,
 ) -> dict[str, Any]:
-    """Build the full Compose document for n_instances DVD litemode stacks."""
+    """Build the full Compose document for n_instances DVD litemode stacks.
+
+    ``host_cpus`` (optional): when supplied, each container gets a ``cpuset:``
+    band so the Linux scheduler can't pile bursts from multiple drones onto
+    the same physical core. Pass None to skip pinning (legacy behaviour).
+    """
     services: dict[str, Any] = {}
     networks: dict[str, Any] = {}
     volumes: dict[str, Any] = {}
 
     for n in range(start_index, start_index + n_instances):
         services.update(instance_services(
-            n, include_gcs=include_gcs, waypoints_dir=waypoints_dir, raw_dir=raw_dir,
+            n,
+            include_gcs=include_gcs,
+            waypoints_dir=waypoints_dir,
+            raw_dir=raw_dir,
+            total_n=n_instances,
+            host_cpus=host_cpus,
         ))
         networks[f"dvd-net-{n}"] = instance_network(n)
         volumes.update(instance_volumes(n))
@@ -676,12 +784,38 @@ def main(argv: list[str] | None = None) -> int:
         with suppress(PermissionError):
             log_dir.chmod(0o777)
 
+    # Determine host CPU count for cpuset pinning. Prefer --cpus when supplied
+    # (operator's view of usable budget on this host), else fall back to
+    # os.cpu_count(). When unset (None), generate() skips cpuset emission.
+    host_cpus_arg: int | None
+    if args.cpus is not None:
+        host_cpus_arg = int(args.cpus)
+    else:
+        detected = os.cpu_count()
+        host_cpus_arg = int(detected) if detected else None
+
+    if host_cpus_arg is not None:
+        usable = max(1, host_cpus_arg - int(_OS_CPU_OVERHEAD))
+        cores_per = max(1, usable // n)
+        if usable < n:
+            print(
+                f"note: host has {host_cpus_arg} CPUs ({usable} usable after OS overhead) "
+                f"vs {n} instances — cpuset bands will overlap (round-robin). "
+                f"Consider --instances {usable} for non-overlapping pinning."
+            )
+        else:
+            print(
+                f"note: cpuset pinning enabled — {cores_per} core(s) per instance "
+                f"(usable={usable}, instances={n})."
+            )
+
     compose = generate(
         n,
         start_index=start_index,
         include_gcs=args.include_gcs,
         waypoints_dir=waypoints_dir,
         raw_dir=raw_dir,
+        host_cpus=host_cpus_arg,
     )
 
     # Report which waypoints resolution each instance got

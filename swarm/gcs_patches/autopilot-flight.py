@@ -33,6 +33,19 @@ _RETRIES = int(os.getenv("MISSION_UPLOAD_RETRIES", "3"))
 connection_string = f"tcp:10.13.{_instance}.3:5760"
 
 
+# Per-sub-step timing so the next sim run pinpoints whether mission_upload,
+# mission_ack, or AUTO-mode-set is the long pole. ``flush=True`` is required —
+# print() in a Docker container buffers indefinitely otherwise.
+_t0 = time.monotonic()
+
+
+def _step(label: str) -> None:
+    global _t0
+    elapsed = time.monotonic() - _t0
+    print(f"[stage3 instance={_instance}] step={label} elapsed={elapsed:.2f}s", flush=True)
+    _t0 = time.monotonic()
+
+
 def read_waypoints(filename):
     waypoints = []
     with open(filename) as file:
@@ -84,6 +97,7 @@ def upload_once(master, waypoints):
     )
 
     uploaded = 0
+    _upload_start = time.monotonic()
     while uploaded < len(waypoints):
         msg = master.recv_match(
             type=["MISSION_REQUEST"], blocking=True, timeout=_REQUEST_TIMEOUT
@@ -115,8 +129,20 @@ def upload_once(master, waypoints):
         )
         uploaded = seq + 1
 
+    _upload_elapsed = time.monotonic() - _upload_start
+    print(
+        f"[stage3 instance={_instance}] step=mission_upload elapsed={_upload_elapsed:.2f}s "
+        f"({len(waypoints)} waypoints)",
+        flush=True,
+    )
+    _ack_start = time.monotonic()
     ack = master.recv_match(
         type=["MISSION_ACK"], blocking=True, timeout=_ACK_TIMEOUT
+    )
+    _ack_elapsed = time.monotonic() - _ack_start
+    print(
+        f"[stage3 instance={_instance}] step=mission_ack elapsed={_ack_elapsed:.2f}s",
+        flush=True,
     )
     if ack is None:
         raise TimeoutError(f"MISSION_ACK missing after {_ACK_TIMEOUT:.0f}s")
@@ -125,23 +151,35 @@ def upload_once(master, waypoints):
 
 
 waypoints = read_waypoints("/opt/gcs/missions/waypoints_custom_zigzag_square.txt")
+_step("read_waypoints")
 master = connect_to_drone(connection_string)
+_step("tcp_connect_+_heartbeat")
 
 attempts = _RETRIES + 1
 last_err: Exception | None = None
 for attempt in range(1, attempts + 1):
+    print(
+        f"[stage3 instance={_instance}] attempt={attempt}/{attempts} starting",
+        flush=True,
+    )
     try:
         upload_once(master, waypoints)
+        _auto_start = time.monotonic()
         master.set_mode_auto()
-        print(f"AUTO mode set, mission started (attempt {attempt}/{attempts})")
+        _auto_elapsed = time.monotonic() - _auto_start
+        print(
+            f"[stage3 instance={_instance}] step=auto_mode_set elapsed={_auto_elapsed:.2f}s",
+            flush=True,
+        )
+        print(f"AUTO mode set, mission started (attempt {attempt}/{attempts})", flush=True)
         sys.exit(0)
     except (TimeoutError, RuntimeError) as exc:
         last_err = exc
-        print(f"Mission upload attempt {attempt}/{attempts} failed: {exc}")
+        print(f"Mission upload attempt {attempt}/{attempts} failed: {exc}", flush=True)
         try:
             master.waypoint_clear_all_send()
         except Exception as clear_exc:
-            print(f"  clear-all failed: {clear_exc}")
+            print(f"  clear-all failed: {clear_exc}", flush=True)
         time.sleep(1.0)
 
 print(f"Mission upload failed after {attempts} attempts: {last_err}")
