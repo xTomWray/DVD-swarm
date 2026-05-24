@@ -383,10 +383,13 @@ audit:
 
 # Import legacy dvdsh-format captures into the current training-data layout.
 # DuckDB-based — ~10s per 50-drone run vs minutes for the old Python loop.
+# Parquet is sorted by (drone_id, mav_packet_type) for fast predicate pushdown
+# in the trainer. ZSTD level-1 compression writes ~2-3× faster than the default.
 #   make transfer SRC=/path/nominal_data CLASS=benign
 #   make transfer SRC=/path/attack_data  CLASS=attack
 #   make transfer SRC=/path/attack_data  CLASS=attack RUNS="attitude-spoof gps-spoof"
 #   make transfer SRC=... CLASS=... DST=/somewhere/else FORCE=1
+#   make transfer SRC=... CLASS=... WORKERS=4   # parallel across runs
 transfer:
 	@test -n "$(SRC)"   || (echo "ERROR: pass SRC=<dir>"   && exit 1)
 	@test -n "$(CLASS)" || (echo "ERROR: pass CLASS=attack|benign" && exit 1)
@@ -396,7 +399,8 @@ transfer:
 	    $(if $(DST),--dst $(DST)) \
 	    $(if $(RUNS),--runs $(RUNS)) \
 	    $(if $(FORCE),--force) \
-	    $(if $(NO_PARQUET),--no-parquet)
+	    $(if $(NO_PARQUET),--no-parquet) \
+	    $(if $(WORKERS),--workers $(WORKERS))
 
 # Re-verify integrity of already-converted legacy runs. Read-only — just
 # cross-checks parquet row+drone counts against the original source tree.

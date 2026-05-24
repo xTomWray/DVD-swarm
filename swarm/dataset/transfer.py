@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -124,6 +126,8 @@ def _build_flight_parquet_from_legacy(
     src_run_dir: Path,
     out_pq: Path,
     attack_type_value: str,
+    *,
+    duckdb_threads: int | None = None,
 ) -> tuple[int, list[int]]:
     """One DuckDB query: read every per-type CSV across every drone in a run.
 
@@ -140,8 +144,14 @@ def _build_flight_parquet_from_legacy(
     pq_path = str(out_pq).replace("'", "''")
     atk = attack_type_value.replace("'", "''")
 
+    if duckdb_threads is not None:
+        con.execute(f"SET threads = {duckdb_threads}")
+
     # all_varchar=true matches analyze.py (keeps mixed-type checksum columns
     # readable); pandas coerces numerics later in the trainer.
+    # ORDER BY drone_id, mav_packet_type tightens row-group statistics so the
+    # trainer's predicate-pushdown skips ~N-1/N row groups per drone read.
+    # COMPRESSION_LEVEL 1 cuts write time ~2-3× vs default level 3 at ~10% size cost.
     con.execute(f"""
         COPY (
             SELECT
@@ -153,7 +163,8 @@ def _build_flight_parquet_from_legacy(
                                union_by_name=true,
                                all_varchar=true,
                                filename=true)
-        ) TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            ORDER BY drone_id, mav_packet_type
+        ) TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 1)
     """)
 
     rows = con.execute(f"""
@@ -268,6 +279,7 @@ def convert_run(
     *,
     build_parquet: bool = True,
     force: bool = False,
+    duckdb_threads: int | None = None,
 ) -> Path:
     """Convert one legacy run to the current format. Returns the output run dir.
 
@@ -299,6 +311,7 @@ def convert_run(
                 src_run_dir=legacy.src_run_dir,
                 out_pq=out_run_dir / "flight.parquet",
                 attack_type_value=attack_type_value,
+                duckdb_threads=duckdb_threads,
             )
             _write_drone_csv_stubs(out_run_dir / "csv", drone_ids)
             drone_count = len(drone_ids)
@@ -335,6 +348,23 @@ def convert_run(
     return out_run_dir
 
 
+def _convert_run_worker(
+    legacy: LegacyRun,
+    dst: Path,
+    class_name: str,
+    build_parquet: bool,
+    force: bool,
+    duckdb_threads: int,
+) -> None:
+    """Top-level wrapper so ProcessPoolExecutor can pickle it."""
+    convert_run(
+        legacy, dst, class_name,
+        build_parquet=build_parquet,
+        force=force,
+        duckdb_threads=duckdb_threads,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__.split("\n", 1)[0],
@@ -360,6 +390,9 @@ def main(argv: list[str] | None = None) -> int:
                          "parquet row/drone counts against the legacy source).")
     ap.add_argument("--force", action="store_true",
                     help="Re-convert even if the destination already has flight.parquet.")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="Parallel conversion workers (default: 1). Each worker handles "
+                         "one run; DuckDB threads per worker = cpu_count // workers.")
     args = ap.parse_args(argv)
 
     src = args.src.resolve()
@@ -417,6 +450,40 @@ def main(argv: list[str] | None = None) -> int:
         print("\nAll verified.")
         return 0
 
+    n_workers = min(args.workers, len(runs))
+    threads_each = max(1, (os.cpu_count() or 4) // n_workers)
+
+    if n_workers > 1:
+        print(
+            f"Transferring {len(runs)} legacy run(s) → {dst}  "
+            f"[{n_workers} workers × {threads_each} DuckDB thread(s) each]"
+        )
+        fut_to_run: dict[Future[None], LegacyRun] = {}
+        failures: list[str] = []
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            for legacy in runs:
+                fut = pool.submit(
+                    _convert_run_worker,
+                    legacy, dst, args.class_name,
+                    not args.no_parquet, args.force, threads_each,
+                )
+                fut_to_run[fut] = legacy
+
+            for fut in as_completed(fut_to_run):
+                legacy = fut_to_run[fut]
+                label = f"{legacy.attack_kind}/" if legacy.attack_kind else ""
+                try:
+                    fut.result()
+                except Exception as exc:
+                    msg = f"FATAL ({label}{legacy.src_run_dir.name}): {exc}"
+                    print(f"\n{msg}", file=sys.stderr)
+                    failures.append(msg)
+
+        if failures:
+            return 2
+        return 0
+
+    # Sequential path (--workers 1, the default).
     print(f"Transferring {len(runs)} legacy run(s) → {dst}")
     for legacy in runs:
         label = f"{legacy.attack_kind}/" if legacy.attack_kind else ""
@@ -426,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
                 legacy, dst, args.class_name,
                 build_parquet=not args.no_parquet,
                 force=args.force,
+                duckdb_threads=threads_each,
             )
         except IntegrityError as exc:
             print(f"\nFATAL: {exc}", file=sys.stderr)

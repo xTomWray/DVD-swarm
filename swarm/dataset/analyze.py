@@ -60,8 +60,9 @@ def _ensure_parquet(run_dir: Path, force: bool) -> Path:
                                union_by_name=true,
                                all_varchar=true,
                                filename=true)
+            ORDER BY drone_id, mav_packet_type
         )
-        TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 1)
     """)
     print(f"  → {pq.stat().st_size / 1e6:.1f} MB", file=sys.stderr)
     return pq
