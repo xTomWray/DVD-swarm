@@ -118,12 +118,20 @@ def _evaluate_run(
     bilstm: Any,
     model: Any,
     scaler: Any,
+    feature_columns: list[str] | None,
     primary: str,
     core_cols: list[str],
     window_size: int,
     stride: int,
 ) -> dict[str, Any]:
-    """Window every drone in one run, predict, return the raw arrays."""
+    """Window every drone in one run, predict, return the raw arrays.
+
+    Mirrors the trainer's ``_aligned_features``: reindexes each drone's
+    feature frame to the column order the scaler was fit on, filling
+    missing columns with 0 (matches training-time behavior). Without
+    this step, ``scaler.transform`` silently scales the wrong columns
+    whenever a drone happens to have fewer/extra engineered features.
+    """
     import numpy as np
     Xs: list[Any] = []
     ys: list[int] = []
@@ -136,7 +144,10 @@ def _evaluate_run(
         if rows is None:
             skipped += 1
             continue
-        scaled = scaler.transform(rows["features"].values)
+        frame = rows["features"]
+        if feature_columns is not None:
+            frame = frame.reindex(columns=feature_columns, fill_value=0).fillna(0)
+        scaled = scaler.transform(frame.values)
         wlm = bilstm.make_windows_from_scaled_rows(rows, scaled, window_size, stride)
         if wlm is None:
             skipped += 1
@@ -280,27 +291,68 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     manifest = json.loads(manifest_path.read_text())
-    primary = manifest["primary_type"]
-    manifest_window = int(manifest["window_size"])
-    manifest_stride = int(manifest["stride"])
+    manifest_primary = manifest.get("primary_type")
+    manifest_window = int(manifest["window_size"]) if "window_size" in manifest else None
+    manifest_stride = int(manifest["stride"]) if "stride" in manifest else None
 
-    # CLI overrides win over the manifest (manifest sidecars get overwritten
-    # when users train multiple variants with the same --output stem).
-    window_size = args.window_size if args.window_size is not None else manifest_window
-    stride = args.stride if args.stride is not None else manifest_stride
+    # Heavy imports now that we know we need them.
+    bilstm = _load_trainer_module()
+    import joblib
+    import tensorflow as tf
+
+    # The trainer saves a bundle dict to *_scaler.joblib that includes the
+    # actual StandardScaler PLUS authoritative copies of primary_type,
+    # window_size, stride, and feature_columns. The bundle is the source of
+    # truth: it's written atomically with the model, so it can't drift the
+    # way the manifest can (manifests share a stem with the .keras and get
+    # overwritten by later runs with the same --output).
+    scaler_blob = joblib.load(scaler_path)
+    if isinstance(scaler_blob, dict) and "scaler" in scaler_blob:
+        scaler = scaler_blob["scaler"]
+        bundle_primary = scaler_blob.get("primary_type")
+        bundle_window = scaler_blob.get("window_size")
+        bundle_stride = scaler_blob.get("stride")
+        feature_columns = scaler_blob.get("feature_columns")
+    else:
+        # Older format: bare scaler, no metadata bundle.
+        scaler = scaler_blob
+        bundle_primary = bundle_window = bundle_stride = feature_columns = None
+
+    # Precedence: CLI override → bundle → manifest.
+    primary = bundle_primary or manifest_primary
+    window_size = (
+        args.window_size if args.window_size is not None
+        else bundle_window if bundle_window is not None
+        else manifest_window
+    )
+    stride = (
+        args.stride if args.stride is not None
+        else bundle_stride if bundle_stride is not None
+        else manifest_stride
+    )
+    if primary is None or window_size is None or stride is None:
+        print("error: could not determine primary_type/window_size/stride from "
+              "bundle, manifest, or CLI overrides", file=sys.stderr)
+        return 1
+
+    # Warn if the manifest disagrees with the bundle — common after a stem
+    # collision overwrote the manifest. Bundle wins; this is informational.
+    if (bundle_window is not None and manifest_window is not None
+            and bundle_window != manifest_window):
+        print(f"NOTE: bundle says window={bundle_window} but manifest says "
+              f"window={manifest_window} — using bundle (the manifest was "
+              f"likely overwritten by a different training run).",
+              file=sys.stderr)
 
     # Cross-check the model filename for a `_w<N>_s<N>` hint and warn loudly
-    # if the values we're about to use disagree — most common cause of
-    # "results look wrong but I can't tell why".
+    # if the values we're about to use disagree.
     fn_match = _FILENAME_WS_RE.search(keras_path.stem)
     if fn_match:
         fn_w, fn_s = int(fn_match.group(1)), int(fn_match.group(2))
         if (fn_w, fn_s) != (window_size, stride):
             print(
                 f"WARNING: model filename suggests window={fn_w} stride={fn_s}, "
-                f"but using window={window_size} stride={stride} "
-                f"(manifest: window={manifest_window} stride={manifest_stride}"
-                f"{', overridden by CLI' if args.window_size or args.stride else ''}). "
+                f"but using window={window_size} stride={stride}. "
                 f"Pass --window-size {fn_w} --stride {fn_s} if the filename is right.",
                 file=sys.stderr,
             )
@@ -308,13 +360,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"model    : {keras_path}")
     print(f"scaler   : {scaler_path.name}")
     print(f"manifest : {manifest_path.name}")
-    print(f"primary  : {primary}  window={window_size}  stride={stride}"
-          f"{f'  (manifest had window={manifest_window} stride={manifest_stride})' if (window_size, stride) != (manifest_window, manifest_stride) else ''}")
-
-    # Heavy imports now that we know we need them.
-    bilstm = _load_trainer_module()
-    import joblib
-    import tensorflow as tf
+    src = ("CLI" if (args.window_size or args.stride) else
+           "bundle" if (bundle_window or bundle_stride) else "manifest")
+    print(f"primary  : {primary}  window={window_size}  stride={stride}  [source: {src}]")
+    if feature_columns is not None:
+        print(f"features : {len(feature_columns)} columns (from scaler bundle)")
 
     core_cols = bilstm.get_feature_cols(primary + ".csv")
     if core_cols is None:
@@ -342,7 +392,6 @@ def main(argv: list[str] | None = None) -> int:
           f"under {data_dir}\n")
 
     model = tf.keras.models.load_model(str(keras_path), compile=False)
-    scaler = joblib.load(scaler_path)
 
     per_run: list[dict[str, Any]] = []
     for run_dir in sorted(runs):
@@ -352,7 +401,8 @@ def main(argv: list[str] | None = None) -> int:
             continue
         result = _evaluate_run(
             run_dir, runs[run_dir], run_label,
-            bilstm=bilstm, model=model, scaler=scaler, primary=primary,
+            bilstm=bilstm, model=model, scaler=scaler,
+            feature_columns=feature_columns, primary=primary,
             core_cols=core_cols, window_size=window_size, stride=stride,
         )
         m = _per_run_metrics(result, args.threshold)
