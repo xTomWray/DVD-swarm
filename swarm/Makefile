@@ -360,12 +360,19 @@ restore:
 # Fast post-run analysis. First call per run converts csv/drone_*.csv into
 # output/<run>/flight.parquet (ZSTD); subsequent calls are sub-second. The
 # default report covers attack-label coverage, row volume, message-type mix,
-# and VFR_HUD/ATTITUDE dynamics split by attack_type. Pass SQL='...' for an
-# ad-hoc query, RUN=output/run_... for a specific run, FORCE=1 to rebuild.
+# and VFR_HUD/ATTITUDE dynamics split by attack_type.
+#   make analyze                           # report on latest run
+#   make analyze RUN=output/run_...        # specific run
+#   make analyze FORCE=1                   # rebuild parquet
+#   make analyze SQL='SELECT ...'          # ad-hoc query
+#   make analyze ALL=1 WORKERS=8          # batch-build parquet for all runs (parallel)
+#   make analyze ALL=1 DATA=output WORKERS=8  # explicit data dir
 analyze:
 	@cd .. && $(PYTHON) -m swarm.dataset.analyze \
+	    $(if $(ALL),--batch $(if $(DATA),$(DATA),output)) \
 	    $(if $(RUN),--run $(RUN)) \
 	    $(if $(FORCE),--force) \
+	    $(if $(WORKERS),--workers $(WORKERS)) \
 	    $(if $(SQL),--sql "$(SQL)")
 
 # Read-only structural audit of a dataset directory: per-class row + window
