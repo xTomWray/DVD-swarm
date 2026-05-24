@@ -12,7 +12,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep audit
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep audit transfer
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -54,6 +54,10 @@ help:
 	@echo "  make audit [DATA=<dir>] [PRIMARY=<msg>] [WINDOW=<n>] [STRIDE=<n>]"
 	@echo "      Row/window counts + sufficiency warnings across a data dir."
 	@echo "      Defaults: DATA=training-data PRIMARY=ATTITUDE WINDOW=80 STRIDE=2"
+	@echo ""
+	@echo "  make transfer SRC=<dir> CLASS=attack|benign [RUNS=\"...\"]"
+	@echo "      Import legacy dvdsh-format captures into training-data/{attack,benign}/."
+	@echo "      Fast: DuckDB-based; builds flight.parquet inline. Idempotent."
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
@@ -372,6 +376,23 @@ audit:
 	    --primary-type $(if $(PRIMARY),$(PRIMARY),ATTITUDE) \
 	    --window-size $(if $(WINDOW),$(WINDOW),80) \
 	    --stride $(if $(STRIDE),$(STRIDE),2)
+
+# Import legacy dvdsh-format captures into the current training-data layout.
+# DuckDB-based — ~10s per 50-drone run vs minutes for the old Python loop.
+#   make transfer SRC=/path/nominal_data CLASS=benign
+#   make transfer SRC=/path/attack_data  CLASS=attack
+#   make transfer SRC=/path/attack_data  CLASS=attack RUNS="attitude-spoof gps-spoof"
+#   make transfer SRC=... CLASS=... DST=/somewhere/else FORCE=1
+transfer:
+	@test -n "$(SRC)"   || (echo "ERROR: pass SRC=<dir>"   && exit 1)
+	@test -n "$(CLASS)" || (echo "ERROR: pass CLASS=attack|benign" && exit 1)
+	@cd .. && $(PYTHON) -m swarm.dataset.transfer \
+	    --src $(SRC) \
+	    --class $(CLASS) \
+	    $(if $(DST),--dst $(DST)) \
+	    $(if $(RUNS),--runs $(RUNS)) \
+	    $(if $(FORCE),--force) \
+	    $(if $(NO_PARQUET),--no-parquet)
 
 # List archives newest first with file sizes. Shows both legacy .tar.gz
 # and new .tar.zst.
