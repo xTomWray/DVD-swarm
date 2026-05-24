@@ -12,7 +12,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep audit transfer verify-transfer
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep audit transfer verify-transfer evaluate
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -62,6 +62,10 @@ help:
 	@echo ""
 	@echo "  make verify-transfer SRC=<dir> CLASS=attack|benign"
 	@echo "      Re-check integrity of already-converted legacy runs (no rebuild)."
+	@echo ""
+	@echo "  make evaluate MODEL=<dir|*.keras> DATA=<runs-dir> [THRESHOLD=0.5] [RUNS=\"...\"] [JSON_OUT=path]"
+	@echo "      Score a trained biLSTM (1Layer) against arbitrary held-out runs."
+	@echo "      Per-run + aggregate metrics; FPR for benign runs, P/R/F1 for attack runs."
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
@@ -423,6 +427,24 @@ verify-transfer:
 	    --verify-only \
 	    $(if $(DST),--dst $(DST)) \
 	    $(if $(RUNS),--runs $(RUNS))
+
+# Score a trained 1Layer biLSTM against arbitrary held-out runs.
+# MODEL points to either the *.keras file or the dir containing it (plus its
+# *_scaler.joblib + *_split_manifest.json sidecars). DATA points to any tree
+# containing csv/drone_*.csv runs (with metadata.json:attack for labeling).
+#   make evaluate MODEL=batch512_1layer DATA=training-data/benign/run_legacy-nominal-1_none_legacy
+#   make evaluate MODEL=batch512_1layer DATA=training-data/benign THRESHOLD=0.7
+#   make evaluate MODEL=... DATA=... RUNS="run_a run_b" JSON_OUT=/tmp/eval.json
+evaluate:
+	@test -n "$(MODEL)" || (echo "ERROR: pass MODEL=<dir|*.keras>" && exit 1)
+	@test -n "$(DATA)"  || (echo "ERROR: pass DATA=<runs-dir>"    && exit 1)
+	@cd .. && $(PYTHON) -m swarm.dataset.evaluate \
+	    --model $(MODEL) \
+	    --data-dir $(DATA) \
+	    $(if $(THRESHOLD),--threshold $(THRESHOLD)) \
+	    $(if $(RUNS),--runs $(RUNS)) \
+	    $(if $(JSON_OUT),--json-out $(JSON_OUT)) \
+	    $(if $(VERBOSE_DETECTION),--verbose-detection)
 
 # List archives newest first with file sizes. Shows both legacy .tar.gz
 # and new .tar.zst.
