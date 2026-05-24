@@ -183,6 +183,84 @@ def _write_drone_csv_stubs(
         (csv_dir / f"drone_{drone_id:03d}.csv").write_text(header)
 
 
+class IntegrityError(RuntimeError):
+    """Raised when the converted parquet doesn't match the legacy source."""
+
+
+def verify_run(
+    con: duckdb.DuckDBPyConnection,
+    src_run_dir: Path,
+    out_run_dir: Path,
+    *,
+    expected_attack_type: str,
+) -> dict[str, object]:
+    """Cross-check the converted parquet against the legacy source.
+
+    Three invariants — fail loudly on any drift:
+      1. parquet row count == sum of source per-type CSV rows (minus headers).
+      2. distinct drone_id in parquet == count of drone subdirs in source.
+      3. every parquet row's attack_type equals ``expected_attack_type``
+         (the constant we set during conversion).
+
+    Returns a dict with all measured values for logging. Raises
+    ``IntegrityError`` on mismatch.
+    """
+    pq = out_run_dir / "flight.parquet"
+    if not pq.exists():
+        raise IntegrityError(f"flight.parquet not found at {pq}")
+
+    src_pattern = str(src_run_dir / "*" / "*.csv").replace("'", "''")
+    pq_path = str(pq).replace("'", "''")
+
+    # Source row count: COUNT(*) across all per-type CSVs. DuckDB strips the
+    # header row automatically when reading via read_csv_auto.
+    src_rows = con.execute(
+        f"SELECT COUNT(*) FROM read_csv_auto('{src_pattern}', "
+        f"union_by_name=true, all_varchar=true)"
+    ).fetchone()[0]
+    pq_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{pq_path}')").fetchone()[0]
+
+    src_drones = sum(1 for p in src_run_dir.iterdir()
+                     if p.is_dir() and _DRONE_NUMBER_RE.search(p.name))
+    pq_drones = con.execute(
+        f"SELECT COUNT(DISTINCT drone_id) FROM read_parquet('{pq_path}') "
+        f"WHERE drone_id IS NOT NULL"
+    ).fetchone()[0]
+    null_drone_id = con.execute(
+        f"SELECT COUNT(*) FROM read_parquet('{pq_path}') WHERE drone_id IS NULL"
+    ).fetchone()[0]
+
+    # attack_type distinct values: must be exactly {expected_attack_type}.
+    atk_distinct = [
+        r[0] for r in con.execute(
+            f"SELECT DISTINCT attack_type FROM read_parquet('{pq_path}')"
+        ).fetchall()
+    ]
+
+    issues: list[str] = []
+    if src_rows != pq_rows:
+        issues.append(f"row count mismatch: src={src_rows:,} pq={pq_rows:,} diff={src_rows-pq_rows:+,}")
+    if src_drones != pq_drones:
+        issues.append(f"drone count mismatch: src={src_drones} pq={pq_drones}")
+    if null_drone_id > 0:
+        issues.append(f"{null_drone_id:,} parquet row(s) have NULL drone_id (regex extraction failed)")
+    if atk_distinct != [expected_attack_type]:
+        issues.append(f"attack_type values not constant: {atk_distinct!r} (expected [{expected_attack_type!r}])")
+
+    if issues:
+        raise IntegrityError(
+            f"verify failed for {out_run_dir.name}:\n  - " + "\n  - ".join(issues)
+        )
+
+    return {
+        "src_rows": int(src_rows),
+        "pq_rows": int(pq_rows),
+        "src_drones": int(src_drones),
+        "pq_drones": int(pq_drones),
+        "attack_type": expected_attack_type,
+    }
+
+
 def convert_run(
     legacy: LegacyRun,
     dst_root: Path,
@@ -225,6 +303,13 @@ def convert_run(
             _write_drone_csv_stubs(out_run_dir / "csv", drone_ids)
             drone_count = len(drone_ids)
             print(f"  parquet: {total_rows:,} rows across {drone_count} drone(s)")
+            # Integrity check — fail loudly if the parquet doesn't match source.
+            stats = verify_run(
+                con, legacy.src_run_dir, out_run_dir,
+                expected_attack_type=attack_type_value,
+            )
+            print(f"  ✓ verified: {stats['src_rows']:,} src == {stats['pq_rows']:,} pq, "
+                  f"{stats['pq_drones']} drone(s)")
         else:
             # --no-parquet fallback: still discover drones, write CSV stubs only.
             drone_ids = []
@@ -269,6 +354,10 @@ def main(argv: list[str] | None = None) -> int:
                          "attack-kind dirs (attitude-spoof ...).")
     ap.add_argument("--no-parquet", action="store_true",
                     help="Skip the flight.parquet build (run `make analyze` later).")
+    ap.add_argument("--verify-only", action="store_true",
+                    help="Skip conversion; just re-run integrity checks on the "
+                         "already-converted runs under --dst (cross-checks "
+                         "parquet row/drone counts against the legacy source).")
     ap.add_argument("--force", action="store_true",
                     help="Re-convert even if the destination already has flight.parquet.")
     args = ap.parse_args(argv)
@@ -292,15 +381,55 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
 
+    if args.verify_only:
+        print(f"Verifying {len(runs)} converted run(s) under {dst}")
+        con = duckdb.connect()
+        failures: list[str] = []
+        try:
+            for legacy in runs:
+                run_num = _run_number(legacy.src_run_dir.name) or 0
+                slug = _slug_for_dst(args.class_name, legacy.attack_kind)
+                attack_type_value = (
+                    "null" if args.class_name == "benign"
+                    else _attack_type_for_kind(legacy.attack_kind or "")
+                )
+                metadata_attack = (
+                    "none" if args.class_name == "benign"
+                    else _attack_type_for_kind(legacy.attack_kind or "")
+                )
+                out_run_dir = dst / f"run_legacy-{slug}-{run_num}_{metadata_attack}_legacy"
+                if not (out_run_dir / "flight.parquet").exists():
+                    print(f"  {out_run_dir.name}: NOT CONVERTED (skipping)")
+                    continue
+                try:
+                    stats = verify_run(con, legacy.src_run_dir, out_run_dir,
+                                       expected_attack_type=attack_type_value)
+                    print(f"  ✓ {out_run_dir.name}: "
+                          f"{stats['pq_rows']:,} rows, {stats['pq_drones']} drone(s)")
+                except IntegrityError as exc:
+                    failures.append(str(exc))
+                    print(f"  ✗ {exc}")
+        finally:
+            con.close()
+        if failures:
+            print(f"\n{len(failures)} run(s) failed verification.", file=sys.stderr)
+            return 2
+        print("\nAll verified.")
+        return 0
+
     print(f"Transferring {len(runs)} legacy run(s) → {dst}")
     for legacy in runs:
         label = f"{legacy.attack_kind}/" if legacy.attack_kind else ""
         print(f"Converting {label}{legacy.src_run_dir.name} ...")
-        convert_run(
-            legacy, dst, args.class_name,
-            build_parquet=not args.no_parquet,
-            force=args.force,
-        )
+        try:
+            convert_run(
+                legacy, dst, args.class_name,
+                build_parquet=not args.no_parquet,
+                force=args.force,
+            )
+        except IntegrityError as exc:
+            print(f"\nFATAL: {exc}", file=sys.stderr)
+            return 2
 
     return 0
 
