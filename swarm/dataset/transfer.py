@@ -18,9 +18,7 @@ Output layout (per run):
         metadata.json            <- {"attack": "...", "source": "...", ...}
 
 The conversion is two DuckDB queries per drone (concat → CSV, then per-run
-parquet build). For a 50-drone capture this is typically <10s total — vs.
-minutes for the old row-by-row converter at
-``swarm/dataset/convert_nominal.py``.
+parquet build). For a 50-drone capture this is typically <10s total.
 
 Usage:
     python -m swarm.dataset.transfer --src /path/nominal_data --class benign
@@ -101,8 +99,13 @@ def _discover_runs(src: Path, class_name: str, run_filter: list[str] | None) -> 
     """
     runs: list[LegacyRun] = []
     if class_name == "benign":
+        # Accept both the original dvdsh shape (`Nominal-<R>/`) and the
+        # `legacy-Nominal-<R>/` shape that appears after a folder has been
+        # renamed to mark it as a pre-converted capture. Match any dir whose
+        # name contains "nominal" (case-insensitive) — the run-number regex
+        # below picks up the trailing integer either way.
         for sub in sorted(p for p in src.iterdir() if p.is_dir()):
-            if not sub.name.lower().startswith("nominal"):
+            if "nominal" not in sub.name.lower():
                 continue
             if run_filter and sub.name not in run_filter:
                 continue
@@ -146,6 +149,14 @@ def _build_flight_parquet_from_legacy(
 
     if duckdb_threads is not None:
         con.execute(f"SET threads = {duckdb_threads}")
+
+    # Cap memory and point spill at out_pq's parent so DuckDB can ORDER BY a
+    # multi-GB string-typed scan without OOM. Without these, DuckDB grabs ~80%
+    # of system RAM, which on a 16 GB box with ~4 GB swap was killed by the
+    # OOM killer on a 50-drone (1.8 GB CSV) run.
+    spill_dir = str(out_pq.parent).replace("'", "''")
+    con.execute("SET memory_limit = '4GB'")
+    con.execute(f"SET temp_directory = '{spill_dir}'")
 
     # all_varchar=true matches analyze.py (keeps mixed-type checksum columns
     # readable); pandas coerces numerics later in the trainer.
