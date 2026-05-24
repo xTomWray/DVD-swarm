@@ -444,6 +444,8 @@ evaluate:
 	    $(if $(THRESHOLD),--threshold $(THRESHOLD)) \
 	    $(if $(RUNS),--runs $(RUNS)) \
 	    $(if $(JSON_OUT),--json-out $(JSON_OUT)) \
+	    $(if $(WINDOW_SIZE),--window-size $(WINDOW_SIZE)) \
+	    $(if $(STRIDE),--stride $(STRIDE)) \
 	    $(if $(VERBOSE_DETECTION),--verbose-detection)
 
 # List archives newest first with file sizes. Shows both legacy .tar.gz

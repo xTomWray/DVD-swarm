@@ -27,9 +27,16 @@ import argparse
 import glob
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
+
+
+# Recognize the `_w<window>_s<stride>` convention some users encode into
+# model filenames (e.g. ``aeroshield_1layer_w160_s10.keras``). Used purely
+# as a cross-check against the manifest values — never silently overrides.
+_FILENAME_WS_RE = re.compile(r"_w(\d+)_s(\d+)", re.IGNORECASE)
 
 # Heavy imports (numpy, joblib, tensorflow, the trainer module) are deferred
 # into ``main`` so ``--help`` is fast and module-import works on hosts that
@@ -258,6 +265,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--verbose-detection", action="store_true",
                     help="Also call the trainer's print_detection_metrics per run "
                          "(verbose: per-drone timing + FN streak stats).")
+    ap.add_argument("--window-size", type=int, default=None,
+                    help="Override the manifest's window_size. Useful when the "
+                         "manifest was overwritten by a different training run "
+                         "(common when multiple --output variants share a stem).")
+    ap.add_argument("--stride", type=int, default=None,
+                    help="Override the manifest's stride. See --window-size.")
     args = ap.parse_args(argv)
 
     try:
@@ -268,12 +281,35 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = json.loads(manifest_path.read_text())
     primary = manifest["primary_type"]
-    window_size = int(manifest["window_size"])
-    stride = int(manifest["stride"])
+    manifest_window = int(manifest["window_size"])
+    manifest_stride = int(manifest["stride"])
+
+    # CLI overrides win over the manifest (manifest sidecars get overwritten
+    # when users train multiple variants with the same --output stem).
+    window_size = args.window_size if args.window_size is not None else manifest_window
+    stride = args.stride if args.stride is not None else manifest_stride
+
+    # Cross-check the model filename for a `_w<N>_s<N>` hint and warn loudly
+    # if the values we're about to use disagree — most common cause of
+    # "results look wrong but I can't tell why".
+    fn_match = _FILENAME_WS_RE.search(keras_path.stem)
+    if fn_match:
+        fn_w, fn_s = int(fn_match.group(1)), int(fn_match.group(2))
+        if (fn_w, fn_s) != (window_size, stride):
+            print(
+                f"WARNING: model filename suggests window={fn_w} stride={fn_s}, "
+                f"but using window={window_size} stride={stride} "
+                f"(manifest: window={manifest_window} stride={manifest_stride}"
+                f"{', overridden by CLI' if args.window_size or args.stride else ''}). "
+                f"Pass --window-size {fn_w} --stride {fn_s} if the filename is right.",
+                file=sys.stderr,
+            )
+
     print(f"model    : {keras_path}")
     print(f"scaler   : {scaler_path.name}")
     print(f"manifest : {manifest_path.name}")
-    print(f"primary  : {primary}  window={window_size}  stride={stride}")
+    print(f"primary  : {primary}  window={window_size}  stride={stride}"
+          f"{f'  (manifest had window={manifest_window} stride={manifest_stride})' if (window_size, stride) != (manifest_window, manifest_stride) else ''}")
 
     # Heavy imports now that we know we need them.
     bilstm = _load_trainer_module()
