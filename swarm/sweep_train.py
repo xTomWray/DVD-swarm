@@ -66,6 +66,7 @@ class SweepConfig:
     val_frac: float
     mixed_precision: bool
     skip_warm: bool
+    batch_size: int
 
 
 def _parse_experiment_spec(spec: str) -> Experiment:
@@ -119,6 +120,7 @@ def _load_config(args: argparse.Namespace) -> SweepConfig:
     val_frac = float(pick("val_frac", 0.2))
     mixed_precision = bool(pick("mixed_precision", False))
     skip_warm = bool(args.skip_warm)
+    batch_size = int(pick("batch_size", 64))
 
     if not (data_dir and primary_type and cache_dir):
         raise SystemExit("data_dir, primary_type, and cache_dir are all required.")
@@ -153,6 +155,7 @@ def _load_config(args: argparse.Namespace) -> SweepConfig:
         val_frac=val_frac,
         mixed_precision=mixed_precision,
         skip_warm=skip_warm,
+        batch_size=batch_size,
     )
 
 
@@ -218,6 +221,7 @@ def _child_cmd(cfg: SweepConfig, model: str, exp: Experiment, output_path: str) 
     ]
     if cfg.mixed_precision:
         cmd.append("--mixed-precision")
+    cmd.extend(["--batch-size", str(cfg.batch_size)])
     return cmd
 
 
@@ -349,6 +353,10 @@ def main() -> int:
     parser.add_argument(
         "--skip-warm", action="store_true",
         help="Skip the CPU-only cache warm step; assume caches already populated.",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, dest="batch_size",
+        help="Training batch size passed to each child (default: 64, recommend 512–2048 for A6000).",
     )
     args = parser.parse_args()
     cfg = _load_config(args)

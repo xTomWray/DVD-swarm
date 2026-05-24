@@ -469,13 +469,6 @@ def load_preprocessed_rows(
             np.int64
         ).to_numpy()
 
-    # Preserve current behavior: attack runs contribute only attack-tagged rows.
-    if run_label == "attack":
-        keep_mask = row_labels == 1
-        df = df.loc[keep_mask].reset_index(drop=True)
-        timestamps = timestamps[keep_mask]
-        row_labels = row_labels[keep_mask]
-
     if len(df) == 0:
         return None
 
@@ -534,9 +527,11 @@ def make_windows_from_scaled_rows(
 
 
 def _format_seconds(value: float | None) -> str:
+    """Format a millisecond delay as a human-readable seconds string."""
     if value is None:
         return "None"
-    return f"{value:.6f}"
+    seconds = value / 1000.0
+    return f"{seconds:.3f}s"
 
 
 def _max_false_negative_streak(records: list[dict[str, object]]) -> int:
@@ -624,6 +619,36 @@ def print_detection_metrics(split_name, y_true, y_prob, y_pred, metadata) -> Non
                 bucket = min((position * 3) // n_run_attack_windows, 2)
                 false_negative_positions[position_names[bucket]] += 1
 
+    # Onset-aligned per-drone latency: how many attack-labeled windows pass
+    # (and how many real seconds elapse) between the first attack-touching
+    # window and the first correctly-classified one. Index 0 means the model
+    # caught the very first attack window — best case.
+    windows_after_onset_per_drone: dict[str, int | None] = {}
+    seconds_after_onset_per_drone: dict[str, float | None] = {}
+    for drone_key, drone_records in records_by_drone.items():
+        drone_records_sorted = sorted(
+            drone_records, key=lambda r: (r["window_end_timestamp"], r["window_index"])
+        )
+        onset_ts = float(drone_records_sorted[0]["window_end_timestamp"])
+        first_idx = next(
+            (i for i, r in enumerate(drone_records_sorted) if r["y_pred"] == 1), None
+        )
+        if first_idx is None:
+            windows_after_onset_per_drone[drone_key] = None
+            seconds_after_onset_per_drone[drone_key] = None
+        else:
+            windows_after_onset_per_drone[drone_key] = first_idx
+            seconds_after_onset_per_drone[drone_key] = (
+                float(drone_records_sorted[first_idx]["window_end_timestamp"]) - onset_ts
+            ) / 1000.0
+
+    detected_windows_after_onset = [
+        v for v in windows_after_onset_per_drone.values() if v is not None
+    ]
+    detected_seconds_after_onset = [
+        v for v in seconds_after_onset_per_drone.values() if v is not None
+    ]
+
     mean_time_to_first_detection = float(np.mean(detected_delays)) if detected_delays else None
     median_time_to_first_detection = float(np.median(detected_delays)) if detected_delays else None
     total_false_negatives = sum(false_negative_positions.values())
@@ -632,6 +657,16 @@ def print_detection_metrics(split_name, y_true, y_prob, y_pred, metadata) -> Non
     print(f"max_consecutive_false_negatives_by_drone_global: {max_drone_fn_streak}")
     print(f"mean_time_to_first_detection: {_format_seconds(mean_time_to_first_detection)}")
     print(f"median_time_to_first_detection: {_format_seconds(median_time_to_first_detection)}")
+    if detected_windows_after_onset:
+        print(f"mean_windows_after_onset: {np.mean(detected_windows_after_onset):.1f}")
+        print(f"median_windows_after_onset: {int(np.median(detected_windows_after_onset))}")
+        print(f"mean_seconds_after_onset: {np.mean(detected_seconds_after_onset):.3f}s")
+        print(f"median_seconds_after_onset: {np.median(detected_seconds_after_onset):.3f}s")
+    else:
+        print("mean_windows_after_onset: None")
+        print("median_windows_after_onset: None")
+        print("mean_seconds_after_onset: None")
+        print("median_seconds_after_onset: None")
     print(f"undetected_attack_runs: {undetected_attack_runs}")
     print("max_consecutive_false_negatives_per_run:")
     for run_dir, streak in sorted(run_fn_streaks.items()):
@@ -643,6 +678,14 @@ def print_detection_metrics(split_name, y_true, y_prob, y_pred, metadata) -> Non
     print("first_detection_delay_per_run:")
     for run_dir, delay in sorted(first_detection_delay_per_run.items()):
         print(f"  {os.path.basename(run_dir)}: {_format_seconds(delay)}")
+    print("first_detection_per_drone (windows | seconds_after_onset):")
+    for drone_key in sorted(windows_after_onset_per_drone):
+        run_dir, drone_file = os.path.split(drone_key)
+        w = windows_after_onset_per_drone[drone_key]
+        s = seconds_after_onset_per_drone[drone_key]
+        w_str = "None" if w is None else f"{w} windows"
+        s_str = "None" if s is None else f"{s:.3f}s"
+        print(f"  {os.path.basename(run_dir)}/{drone_file}: {w_str} | {s_str}")
     print("false_negative_positions:")
     for name in position_names:
         count = false_negative_positions[name]
@@ -781,6 +824,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Bypass the hard-fail when either class has <3 runs. For experimentation only — "
         "val/test may end up class-empty, which makes threshold tuning meaningless.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=64,
+        dest="batch_size",
+        help="Training batch size. Increase (e.g. 512–2048) to saturate GPU. Default: 64.",
     )
     args = parser.parse_args()
 
@@ -1226,7 +1276,7 @@ if __name__ == "__main__":
         X_train,
         y_train,
         epochs=60,
-        batch_size=64,
+        batch_size=args.batch_size,
         validation_data=(X_val, y_val),
         class_weight=class_weight,
         callbacks=callbacks,

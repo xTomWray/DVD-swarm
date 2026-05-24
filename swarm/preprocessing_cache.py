@@ -31,7 +31,7 @@ import joblib
 import numpy as np
 
 
-CACHE_FORMAT_VERSION = 1
+CACHE_FORMAT_VERSION = 2
 
 
 @dataclass(frozen=True)

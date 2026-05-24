@@ -23,6 +23,7 @@ scaler_fit_scope: train_all
 test_frac: 0.2
 val_frac: 0.2
 mixed_precision: true
+batch_size: 512  # increase to 1024–2048 for large GPUs (A6000 etc.)
 
 experiments:
   - {window_size: 60,  stride: 1}
