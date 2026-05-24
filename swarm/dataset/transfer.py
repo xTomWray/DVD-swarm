@@ -119,65 +119,68 @@ def _discover_runs(src: Path, class_name: str, run_filter: list[str] | None) -> 
     return runs
 
 
-def _convert_drone(
+def _build_flight_parquet_from_legacy(
     con: duckdb.DuckDBPyConnection,
-    drone_dir: Path,
-    out_csv: Path,
+    src_run_dir: Path,
+    out_pq: Path,
     attack_type_value: str,
-) -> int:
-    """Union all per-type CSVs in ``drone_dir`` into one drone CSV.
+) -> tuple[int, list[int]]:
+    """One DuckDB query: read every per-type CSV across every drone in a run.
 
-    Returns the number of data rows written. Uses DuckDB's
-    ``read_csv_auto(..., union_by_name=true)`` so missing columns across types
-    become NULLs — same behaviour as the old row-by-row converter but vastly
-    faster. ``attack_type`` is appended as a constant column.
+    Returns ``(total_rows, sorted_drone_ids)``. The drone_id is extracted
+    from the filename path (e.g. ``.../Nominal-11-7/ATTITUDE.csv`` → 7) using
+    the trailing-int-before-/<file>.csv pattern; works for both nominal and
+    attack tree layouts. ``attack_type`` is appended as a constant column.
+
+    DuckDB scans all ~1500 per-type files (50 drones × ~30 types) in parallel,
+    instead of the previous per-drone loop which underfed DuckDB's worker pool.
     """
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
-    pattern = str(drone_dir / "*.csv").replace("'", "''")
-    out_path = str(out_csv).replace("'", "''")
+    out_pq.parent.mkdir(parents=True, exist_ok=True)
+    pattern = str(src_run_dir / "*" / "*.csv").replace("'", "''")
+    pq_path = str(out_pq).replace("'", "''")
     atk = attack_type_value.replace("'", "''")
 
-    # all_varchar=true matches analyze.py — keeps the mixed-type checksum cols
-    # readable without coercion failures, and the trainer's pandas read coerces
-    # numerics later.
+    # all_varchar=true matches analyze.py (keeps mixed-type checksum columns
+    # readable); pandas coerces numerics later in the trainer.
     con.execute(f"""
         COPY (
             SELECT
                 *,
+                CAST(regexp_extract(filename, '-([0-9]+)/[^/]+\\.csv$', 1) AS INTEGER)
+                    AS drone_id,
                 '{atk}' AS attack_type
             FROM read_csv_auto('{pattern}',
-                               union_by_name=true,
-                               all_varchar=true)
-            ORDER BY TRY_CAST(timestamp AS BIGINT)
-        ) TO '{out_path}' (FORMAT CSV, HEADER)
-    """)
-    n = con.execute(
-        f"SELECT COUNT(*) FROM read_csv_auto('{out_path}', all_varchar=true)"
-    ).fetchone()[0]
-    return int(n)
-
-
-def _build_run_parquet(con: duckdb.DuckDBPyConnection, run_out_dir: Path) -> None:
-    """Build flight.parquet from the per-drone CSVs in ``run_out_dir/csv/``.
-
-    Mirrors swarm/dataset/analyze.py:_ensure_parquet so the resulting parquet
-    has the same schema (including drone_id derived from filename) that the
-    trainer's fast-loader expects.
-    """
-    csv_pattern = str(run_out_dir / "csv" / "drone_*.csv").replace("'", "''")
-    pq_path = str(run_out_dir / "flight.parquet").replace("'", "''")
-    con.execute(f"""
-        COPY (
-            SELECT
-                *,
-                CAST(regexp_extract(filename, 'drone_(\\d+)\\.csv', 1) AS INTEGER)
-                    AS drone_id
-            FROM read_csv_auto('{csv_pattern}',
                                union_by_name=true,
                                all_varchar=true,
                                filename=true)
         ) TO '{pq_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
+
+    rows = con.execute(f"""
+        SELECT drone_id, COUNT(*) AS n
+        FROM read_parquet('{pq_path}')
+        WHERE drone_id IS NOT NULL
+        GROUP BY drone_id
+        ORDER BY drone_id
+    """).fetchall()
+    drone_ids = [int(r[0]) for r in rows]
+    total = sum(int(r[1]) for r in rows)
+    return total, drone_ids
+
+
+def _write_drone_csv_stubs(
+    csv_dir: Path,
+    drone_ids: list[int],
+) -> None:
+    """Write tiny header-only ``drone_NNN.csv`` files so the trainer's glob
+    discovers each drone. The trainer prefers ``flight.parquet`` (which we
+    built) and only falls back to these stubs in the rare parquet-read failure
+    case. A minimal header keeps ``pd.read_csv`` from raising EmptyDataError.
+    """
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    header = "mav_packet_type,timestamp,attack_type\n"
+    for drone_id in drone_ids:
+        (csv_dir / f"drone_{drone_id:03d}.csv").write_text(header)
 
 
 def convert_run(
@@ -211,22 +214,28 @@ def convert_run(
     out_run_dir.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect()
-    drone_count = 0
-    total_rows = 0
     try:
-        for drone_dir in sorted(p for p in legacy.src_run_dir.iterdir() if p.is_dir()):
-            m = _DRONE_NUMBER_RE.search(drone_dir.name)
-            if not m:
-                continue
-            drone_id = int(m.group(1))
-            out_csv = out_run_dir / "csv" / f"drone_{drone_id:03d}.csv"
-            n = _convert_drone(con, drone_dir, out_csv, attack_type_value)
-            drone_count += 1
-            total_rows += n
-            print(f"  drone_{drone_id:03d}: {n:>7} rows ({drone_dir.name})")
-
-        if build_parquet and drone_count > 0:
-            _build_run_parquet(con, out_run_dir)
+        if build_parquet:
+            total_rows, drone_ids = _build_flight_parquet_from_legacy(
+                con,
+                src_run_dir=legacy.src_run_dir,
+                out_pq=out_run_dir / "flight.parquet",
+                attack_type_value=attack_type_value,
+            )
+            _write_drone_csv_stubs(out_run_dir / "csv", drone_ids)
+            drone_count = len(drone_ids)
+            print(f"  parquet: {total_rows:,} rows across {drone_count} drone(s)")
+        else:
+            # --no-parquet fallback: still discover drones, write CSV stubs only.
+            drone_ids = []
+            for drone_dir in sorted(p for p in legacy.src_run_dir.iterdir() if p.is_dir()):
+                m = _DRONE_NUMBER_RE.search(drone_dir.name)
+                if m:
+                    drone_ids.append(int(m.group(1)))
+            _write_drone_csv_stubs(out_run_dir / "csv", drone_ids)
+            drone_count = len(drone_ids)
+            total_rows = 0
+            print(f"  --no-parquet: wrote {drone_count} CSV stub(s) only")
     finally:
         con.close()
 
