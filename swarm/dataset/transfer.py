@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -326,8 +327,15 @@ def convert_run(
 ) -> Path:
     """Convert one legacy run to the current format. Returns the output run dir.
 
-    Idempotent unless ``force=True``: skips conversion when both
-    ``flight.parquet`` and any drone CSVs already exist at the destination.
+    Idempotent unless ``force=True``: skips conversion when ``flight.parquet``
+    already exists at the final destination.
+
+    Atomic-write pattern: all artifacts (flight.parquet, csv/, metadata.json)
+    are first written to ``<final>.tmp/``; only after ``verify_run`` passes do
+    we ``Path.rename`` the tmp dir to its final name. If a conversion crashes
+    or is killed mid-write, the dst is left as ``<final>.tmp`` — a clear
+    "this run did not finish" marker. Any pre-existing ``.tmp`` from a prior
+    failed attempt is removed on entry.
     """
     run_num = _run_number(legacy.src_run_dir.name) or 0
     slug = _slug_for_dst(class_name, legacy.attack_kind)
@@ -340,11 +348,23 @@ def convert_run(
         else _attack_type_for_kind(legacy.attack_kind or "")
     )
 
-    out_run_dir = dst_root / f"run_legacy-{slug}-{run_num}_{metadata_attack}_legacy"
-    if not force and (out_run_dir / "flight.parquet").exists():
-        print(f"  skip (already converted): {out_run_dir.name}")
-        return out_run_dir
-    out_run_dir.mkdir(parents=True, exist_ok=True)
+    final_run_dir = dst_root / f"run_legacy-{slug}-{run_num}_{metadata_attack}_legacy"
+    tmp_run_dir = final_run_dir.parent / (final_run_dir.name + ".tmp")
+
+    if not force and (final_run_dir / "flight.parquet").exists():
+        print(f"  skip (already converted): {final_run_dir.name}")
+        return final_run_dir
+
+    # Pre-flight: any stale .tmp is from a previous failed/killed attempt.
+    if tmp_run_dir.exists():
+        print(f"  removing stale tmp dir from previous attempt: {tmp_run_dir.name}")
+        shutil.rmtree(tmp_run_dir)
+    # --force: also nuke the final dir so the rename below doesn't collide.
+    if force and final_run_dir.exists():
+        print(f"  --force: removing existing {final_run_dir.name}")
+        shutil.rmtree(final_run_dir)
+
+    tmp_run_dir.mkdir(parents=True, exist_ok=True)
 
     con = duckdb.connect()
     try:
@@ -352,17 +372,17 @@ def convert_run(
             total_rows, drone_ids = _build_flight_parquet_from_legacy(
                 con,
                 src_run_dir=legacy.src_run_dir,
-                out_pq=out_run_dir / "flight.parquet",
+                out_pq=tmp_run_dir / "flight.parquet",
                 attack_type_value=attack_type_value,
                 duckdb_threads=duckdb_threads,
                 memory_limit=memory_limit,
             )
-            _write_drone_csv_stubs(out_run_dir / "csv", drone_ids)
+            _write_drone_csv_stubs(tmp_run_dir / "csv", drone_ids)
             drone_count = len(drone_ids)
             print(f"  parquet: {total_rows:,} rows across {drone_count} drone(s)")
             # Integrity check — fail loudly if the parquet doesn't match source.
             stats = verify_run(
-                con, legacy.src_run_dir, out_run_dir,
+                con, legacy.src_run_dir, tmp_run_dir,
                 expected_attack_type=attack_type_value,
             )
             print(f"  ✓ verified: {stats['src_rows']:,} src == {stats['pq_rows']:,} pq, "
@@ -374,22 +394,26 @@ def convert_run(
                 m = _DRONE_NUMBER_RE.search(drone_dir.name)
                 if m:
                     drone_ids.append(int(m.group(1)))
-            _write_drone_csv_stubs(out_run_dir / "csv", drone_ids)
+            _write_drone_csv_stubs(tmp_run_dir / "csv", drone_ids)
             drone_count = len(drone_ids)
             total_rows = 0
             print(f"  --no-parquet: wrote {drone_count} CSV stub(s) only")
     finally:
         con.close()
 
-    (out_run_dir / "metadata.json").write_text(json.dumps({
+    (tmp_run_dir / "metadata.json").write_text(json.dumps({
         "attack": metadata_attack,
         "source": str(legacy.src_run_dir.resolve()),
         "drone_count": drone_count,
         "total_rows": total_rows,
         "converter": "swarm.dataset.transfer",
     }, indent=2))
-    print(f"  -> {out_run_dir} ({drone_count} drones, {total_rows:,} rows)")
-    return out_run_dir
+
+    # Atomic publish: rename .tmp → final. POSIX rename is atomic on the same
+    # filesystem; observers either see no final dir or the fully-built one.
+    tmp_run_dir.rename(final_run_dir)
+    print(f"  -> {final_run_dir} ({drone_count} drones, {total_rows:,} rows)")
+    return final_run_dir
 
 
 def _convert_run_worker(
