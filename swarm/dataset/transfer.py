@@ -124,6 +124,20 @@ def _discover_runs(src: Path, class_name: str, run_filter: list[str] | None) -> 
     return runs
 
 
+def _list_candidate_run_names(src: Path, class_name: str) -> list[str]:
+    """Names of top-level subdirs that *could* be runs, ignoring ``--runs``.
+
+    Used purely for diagnostics — lets ``main`` differentiate "src is wrong"
+    from "--runs filter excluded everything", and print the names a user can
+    actually copy-paste back into ``--runs``.
+    """
+    if class_name == "benign":
+        return sorted(p.name for p in src.iterdir()
+                      if p.is_dir() and "nominal" in p.name.lower())
+    # attack: every top-level subdir is a candidate attack-kind dir.
+    return sorted(p.name for p in src.iterdir() if p.is_dir())
+
+
 def _build_flight_parquet_from_legacy(
     con: duckdb.DuckDBPyConnection,
     src_run_dir: Path,
@@ -447,8 +461,33 @@ def main(argv: list[str] | None = None) -> int:
 
     runs = _discover_runs(src, args.class_name, args.runs)
     if not runs:
-        print(f"error: no legacy runs found under {src} for class={args.class_name}",
-              file=sys.stderr)
+        candidates = _list_candidate_run_names(src, args.class_name)
+        if args.runs and candidates:
+            print(
+                f"error: --runs {' '.join(args.runs)} matched 0 of {len(candidates)} "
+                f"available {args.class_name} run(s) under {src}.\n"
+                f"       available: {', '.join(candidates)}\n"
+                f"       (pass the directory NAME, e.g. --runs {candidates[0]})",
+                file=sys.stderr,
+            )
+        elif not candidates:
+            expected = (
+                "<src>/Nominal-<R>/Nominal-<R>-<M>/<TYPE>.csv"
+                if args.class_name == "benign"
+                else "<src>/<attack-kind>/<RUN-NAME>/<RUN-NAME>-<M>/<TYPE>.csv"
+            )
+            print(
+                f"error: no candidate run dirs under {src} for class={args.class_name} "
+                f"(expected layout: {expected})",
+                file=sys.stderr,
+            )
+        else:
+            # Shouldn't normally happen — candidates exist and no filter — but keep
+            # a fallback so we don't silently exit 0.
+            print(
+                f"error: no legacy runs found under {src} for class={args.class_name}",
+                file=sys.stderr,
+            )
         return 1
 
     if args.verify_only:
