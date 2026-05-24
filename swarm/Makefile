@@ -12,7 +12,7 @@ PYTHON        := $(if $(wildcard $(_VENV_PY)),$(_VENV_PY),python3)
 START_INDEX   ?= auto
 COMPOSE       := docker compose -p $(PROJECT_NAME) -f $(COMPOSE_FILE)
 
-.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep audit transfer
+.PHONY: help generate generate-ram pull up down status logs sysctl-check sim sim-multi sim-random sim-benign follow archive restore list-archives analyze sweep audit transfer verify-transfer
 
 help:
 	@echo "DVD Swarm — headless litemode instances"
@@ -58,6 +58,10 @@ help:
 	@echo "  make transfer SRC=<dir> CLASS=attack|benign [RUNS=\"...\"]"
 	@echo "      Import legacy dvdsh-format captures into training-data/{attack,benign}/."
 	@echo "      Fast: DuckDB-based; builds flight.parquet inline. Idempotent."
+	@echo "      Always auto-verifies row + drone counts against source after each run."
+	@echo ""
+	@echo "  make verify-transfer SRC=<dir> CLASS=attack|benign"
+	@echo "      Re-check integrity of already-converted legacy runs (no rebuild)."
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
@@ -393,6 +397,19 @@ transfer:
 	    $(if $(RUNS),--runs $(RUNS)) \
 	    $(if $(FORCE),--force) \
 	    $(if $(NO_PARQUET),--no-parquet)
+
+# Re-verify integrity of already-converted legacy runs. Read-only — just
+# cross-checks parquet row+drone counts against the original source tree.
+#   make verify-transfer SRC=/home/mos/swarm/data/nominal_data CLASS=benign
+verify-transfer:
+	@test -n "$(SRC)"   || (echo "ERROR: pass SRC=<dir>"   && exit 1)
+	@test -n "$(CLASS)" || (echo "ERROR: pass CLASS=attack|benign" && exit 1)
+	@cd .. && $(PYTHON) -m swarm.dataset.transfer \
+	    --src $(SRC) \
+	    --class $(CLASS) \
+	    --verify-only \
+	    $(if $(DST),--dst $(DST)) \
+	    $(if $(RUNS),--runs $(RUNS))
 
 # List archives newest first with file sizes. Shows both legacy .tar.gz
 # and new .tar.zst.
