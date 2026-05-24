@@ -397,6 +397,7 @@ audit:
 #   make transfer SRC=/path/attack_data  CLASS=attack RUNS="attitude-spoof gps-spoof"
 #   make transfer SRC=... CLASS=... DST=/somewhere/else FORCE=1
 #   make transfer SRC=... CLASS=... WORKERS=4   # parallel across runs
+#   make transfer SRC=... CLASS=... MEMORY_LIMIT=8GB   # only on small-RAM hosts
 transfer:
 	@test -n "$(SRC)"   || (echo "ERROR: pass SRC=<dir>"   && exit 1)
 	@test -n "$(CLASS)" || (echo "ERROR: pass CLASS=attack|benign" && exit 1)
@@ -407,7 +408,8 @@ transfer:
 	    $(if $(RUNS),--runs $(RUNS)) \
 	    $(if $(FORCE),--force) \
 	    $(if $(NO_PARQUET),--no-parquet) \
-	    $(if $(WORKERS),--workers $(WORKERS))
+	    $(if $(WORKERS),--workers $(WORKERS)) \
+	    $(if $(MEMORY_LIMIT),--memory-limit $(MEMORY_LIMIT))
 
 # Re-verify integrity of already-converted legacy runs. Read-only — just
 # cross-checks parquet row+drone counts against the original source tree.

@@ -131,6 +131,7 @@ def _build_flight_parquet_from_legacy(
     attack_type_value: str,
     *,
     duckdb_threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> tuple[int, list[int]]:
     """One DuckDB query: read every per-type CSV across every drone in a run.
 
@@ -141,6 +142,12 @@ def _build_flight_parquet_from_legacy(
 
     DuckDB scans all ~1500 per-type files (50 drones × ~30 types) in parallel,
     instead of the previous per-drone loop which underfed DuckDB's worker pool.
+
+    Tuning:
+        ``memory_limit`` (e.g. ``'8GB'``) — forces DuckDB to spill the ORDER
+        BY to disk once it would exceed the cap. Only set this on
+        memory-constrained boxes; on a big server, leaving it unset lets
+        DuckDB use ~80% of RAM and finish entirely in-memory (fastest).
     """
     out_pq.parent.mkdir(parents=True, exist_ok=True)
     pattern = str(src_run_dir / "*" / "*.csv").replace("'", "''")
@@ -150,13 +157,23 @@ def _build_flight_parquet_from_legacy(
     if duckdb_threads is not None:
         con.execute(f"SET threads = {duckdb_threads}")
 
-    # Cap memory and point spill at out_pq's parent so DuckDB can ORDER BY a
-    # multi-GB string-typed scan without OOM. Without these, DuckDB grabs ~80%
-    # of system RAM, which on a 16 GB box with ~4 GB swap was killed by the
-    # OOM killer on a 50-drone (1.8 GB CSV) run.
+    # preserve_insertion_order=false lets DuckDB pipeline rows out of arrival
+    # order during the scan; safe because we have an explicit ORDER BY at the
+    # end. Cuts peak memory by skipping the intermediate insertion-order buffer.
+    con.execute("SET preserve_insertion_order = false")
+
+    # Spill location: out_pq's parent. DuckDB only writes here if it actually
+    # exceeds memory_limit, so this is cheap insurance — no I/O when the
+    # query fits in RAM.
     spill_dir = str(out_pq.parent).replace("'", "''")
-    con.execute("SET memory_limit = '4GB'")
     con.execute(f"SET temp_directory = '{spill_dir}'")
+
+    # memory_limit: opt-in. Unset → DuckDB defaults to ~80% of system RAM
+    # (right answer on a fat server; lets the whole sort live in memory).
+    # Set explicitly when running on a small-RAM host to force disk spill.
+    if memory_limit is not None:
+        ml = memory_limit.replace("'", "''")
+        con.execute(f"SET memory_limit = '{ml}'")
 
     # all_varchar=true matches analyze.py (keeps mixed-type checksum columns
     # readable); pandas coerces numerics later in the trainer.
@@ -291,6 +308,7 @@ def convert_run(
     build_parquet: bool = True,
     force: bool = False,
     duckdb_threads: int | None = None,
+    memory_limit: str | None = None,
 ) -> Path:
     """Convert one legacy run to the current format. Returns the output run dir.
 
@@ -323,6 +341,7 @@ def convert_run(
                 out_pq=out_run_dir / "flight.parquet",
                 attack_type_value=attack_type_value,
                 duckdb_threads=duckdb_threads,
+                memory_limit=memory_limit,
             )
             _write_drone_csv_stubs(out_run_dir / "csv", drone_ids)
             drone_count = len(drone_ids)
@@ -366,6 +385,7 @@ def _convert_run_worker(
     build_parquet: bool,
     force: bool,
     duckdb_threads: int,
+    memory_limit: str | None,
 ) -> None:
     """Top-level wrapper so ProcessPoolExecutor can pickle it."""
     convert_run(
@@ -373,6 +393,7 @@ def _convert_run_worker(
         build_parquet=build_parquet,
         force=force,
         duckdb_threads=duckdb_threads,
+        memory_limit=memory_limit,
     )
 
 
@@ -404,6 +425,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--workers", type=int, default=1,
                     help="Parallel conversion workers (default: 1). Each worker handles "
                          "one run; DuckDB threads per worker = cpu_count // workers.")
+    ap.add_argument("--memory-limit", type=str, default=None,
+                    help="DuckDB memory cap, e.g. '8GB'. Default: unset → DuckDB uses "
+                         "~80%% of system RAM (fastest on big-RAM servers, finishes in "
+                         "memory). Set this only on memory-constrained boxes to force "
+                         "spill to disk.")
     args = ap.parse_args(argv)
 
     src = args.src.resolve()
@@ -477,6 +503,7 @@ def main(argv: list[str] | None = None) -> int:
                     _convert_run_worker,
                     legacy, dst, args.class_name,
                     not args.no_parquet, args.force, threads_each,
+                    args.memory_limit,
                 )
                 fut_to_run[fut] = legacy
 
@@ -505,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
                 build_parquet=not args.no_parquet,
                 force=args.force,
                 duckdb_threads=threads_each,
+                memory_limit=args.memory_limit,
             )
         except IntegrityError as exc:
             print(f"\nFATAL: {exc}", file=sys.stderr)
