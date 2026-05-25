@@ -171,8 +171,56 @@ def _evaluate_run(
     }
 
 
+def _summarize_probs(y_prob: Any) -> dict[str, float]:
+    """min/mean/p95/p99/max so users see both bulk and tail behavior."""
+    import numpy as np
+    return {
+        "min": float(y_prob.min()),
+        "mean": float(y_prob.mean()),
+        "p95": float(np.percentile(y_prob, 95)),
+        "p99": float(np.percentile(y_prob, 99)),
+        "max": float(y_prob.max()),
+    }
+
+
+def _confusion(y_true: Any, y_pred: Any) -> dict[str, int]:
+    """Full 2x2 confusion matrix as a dict — TP/FP/FN/TN integers."""
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+    return {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+
+def _precision_recall_f1(cm: dict[str, int]) -> tuple[float, float, float]:
+    tp, fp, fn = cm["tp"], cm["fp"], cm["fn"]
+    p = tp / (tp + fp) if (tp + fp) else 0.0
+    r = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * p * r / (p + r) if (p + r) else 0.0
+    return p, r, f1
+
+
+def _flight_hours(meta_list: list[dict[str, Any]]) -> float:
+    """Per-drone (max end-ts − min start-ts) summed, converted ms→hours.
+
+    Each drone's windows are causal in time, so the timespan covered by
+    its windows is a sensible proxy for that drone's flight duration.
+    Returns 0.0 if no metadata or no positive spans.
+    """
+    if not meta_list:
+        return 0.0
+    spans: dict[tuple[str, str], list[float]] = {}
+    for m in meta_list:
+        key = (m["run_dir"], m["drone_file"])
+        rng = spans.setdefault(key, [float("inf"), float("-inf")])
+        rng[0] = min(rng[0], float(m["window_start_timestamp"]))
+        rng[1] = max(rng[1], float(m["window_end_timestamp"]))
+    total_ms = sum(hi - lo for lo, hi in spans.values() if hi > lo)
+    return total_ms / 1000.0 / 3600.0
+
+
 def _per_run_metrics(result: dict[str, Any], threshold: float) -> dict[str, Any]:
-    """Compute JSON-friendly per-run metrics (no big arrays)."""
+    """JSON-friendly per-run summary at one threshold."""
     base: dict[str, Any] = {
         "name": Path(result["run_dir"]).name,
         "run_label": result["run_label"],
@@ -182,29 +230,24 @@ def _per_run_metrics(result: dict[str, Any], threshold: float) -> dict[str, Any]
     }
     if result["windows"] == 0:
         return base
-    import numpy as np
     y_true = result["y_true"]
     y_prob = result["y_prob"]
     y_pred = (y_prob >= threshold).astype(int)
+    cm = _confusion(y_true, y_pred)
+    p, r, f1 = _precision_recall_f1(cm)
+    probs = _summarize_probs(y_prob)
+    flight_h = _flight_hours(result.get("meta", []))
     base.update({
+        "threshold": threshold,
         "predicted_positive_rate": float(y_pred.mean()),
-        "prob_mean": float(y_prob.mean()),
-        "prob_p95": float(np.percentile(y_prob, 95)),
-        "prob_max": float(y_prob.max()),
+        "flight_hours": flight_h,
+        **cm,
+        "precision": p, "recall": r, "f1": f1,
+        **{f"prob_{k}": v for k, v in probs.items()},
     })
     if result["run_label"] == "benign":
-        fp = int(y_pred.sum())
-        base.update({"false_positives": fp,
-                     "false_positive_rate": fp / result["windows"]})
-    else:
-        tp = int(((y_pred == 1) & (y_true == 1)).sum())
-        fp = int(((y_pred == 1) & (y_true == 0)).sum())
-        fn = int(((y_pred == 0) & (y_true == 1)).sum())
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2 * precision * recall / max(precision + recall, 1e-9)
-        base.update({"tp": tp, "fp": fp, "fn": fn,
-                     "precision": precision, "recall": recall, "f1": f1})
+        base["false_positives"] = cm["fp"]
+        base["false_positive_rate"] = cm["fp"] / result["windows"]
     return base
 
 
@@ -216,44 +259,120 @@ def _print_per_run(m: dict[str, Any]) -> None:
     head = (
         f"  {name:50s}  drones={m['drones']:>3d}  windows={m['windows']:>9,d}  "
         f"pred+={m['predicted_positive_rate']:6.2%}  "
-        f"prob(mean/p95/max)={m['prob_mean']:.3f}/{m['prob_p95']:.3f}/{m['prob_max']:.3f}"
+        f"prob(mean/p95/p99/max)="
+        f"{m['prob_mean']:.3f}/{m['prob_p95']:.3f}/{m['prob_p99']:.3f}/{m['prob_max']:.3f}"
     )
     if m["run_label"] == "benign":
-        print(f"{head}  FP={m['false_positives']:>7,d}  FPR={m['false_positive_rate']:.3%}")
+        print(f"{head}  FP={m['fp']:>7,d}  FPR={m['false_positive_rate']:.3%}")
     else:
-        print(f"{head}  P={m['precision']:.3f}  R={m['recall']:.3f}  F1={m['f1']:.3f}")
+        print(f"{head}  TP={m['tp']:,} FP={m['fp']:,} FN={m['fn']:,} TN={m['tn']:,}"
+              f"  P={m['precision']:.3f}  R={m['recall']:.3f}  F1={m['f1']:.3f}")
 
 
-def _print_aggregate(per_run: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
-    benign = [m for m in per_run if m["run_label"] == "benign" and m["windows"] > 0]
-    attack = [m for m in per_run if m["run_label"] == "attack" and m["windows"] > 0]
-    total_windows = sum(m["windows"] for m in per_run)
-    print(f"\n=== Aggregate @ threshold={threshold:.2f} ===")
-    print(f"  runs:    benign={len(benign)}  attack={len(attack)}  "
-          f"total windows={total_windows:,}")
-    agg: dict[str, Any] = {
-        "threshold": threshold, "total_windows": total_windows,
-        "n_benign_runs": len(benign), "n_attack_runs": len(attack),
-    }
-    if benign:
-        b_windows = sum(m["windows"] for m in benign)
-        b_fp = sum(m["false_positives"] for m in benign)
-        fpr = b_fp / b_windows if b_windows else 0.0
-        print(f"  benign:  windows={b_windows:>9,d}  FP={b_fp:>7,d}  FPR={fpr:.3%}")
-        agg.update({"benign_windows": b_windows, "false_positives": b_fp,
-                    "false_positive_rate": fpr})
-    if attack:
-        a_tp = sum(m["tp"] for m in attack)
-        a_fp = sum(m["fp"] for m in attack)
-        a_fn = sum(m["fn"] for m in attack)
-        p = a_tp / max(a_tp + a_fp, 1)
-        r = a_tp / max(a_tp + a_fn, 1)
-        f1 = 2 * p * r / max(p + r, 1e-9)
-        print(f"  attack:  TP={a_tp:,}  FP={a_fp:,}  FN={a_fn:,}  "
-              f"P={p:.3f}  R={r:.3f}  F1={f1:.3f}")
-        agg.update({"tp": a_tp, "fp": a_fp, "fn": a_fn,
-                    "precision": p, "recall": r, "f1": f1})
+def _aggregate_at_threshold(
+    benign_results: list[dict[str, Any]],
+    attack_results: list[dict[str, Any]],
+    threshold: float,
+) -> dict[str, Any]:
+    """Aggregate metrics at one threshold, computed from raw y_prob arrays
+    (not summed per-run, which would round-trip through stored ints).
+    """
+    import numpy as np
+    agg: dict[str, Any] = {"threshold": threshold}
+    if benign_results:
+        y_prob = np.concatenate([r["y_prob"] for r in benign_results])
+        y_true = np.concatenate([r["y_true"] for r in benign_results])
+        y_pred = (y_prob >= threshold).astype(int)
+        cm = _confusion(y_true, y_pred)
+        n_windows = len(y_prob)
+        n_drones = sum(r["drones"] for r in benign_results)
+        hours = sum(_flight_hours(r.get("meta", [])) for r in benign_results)
+        agg["benign"] = {
+            "windows": n_windows,
+            "drones": n_drones,
+            "flight_hours": hours,
+            **cm,
+            "fpr": cm["fp"] / n_windows if n_windows else 0.0,
+            "fp_per_10k_windows": (cm["fp"] / n_windows * 1e4) if n_windows else 0.0,
+            "fp_per_drone": cm["fp"] / n_drones if n_drones else 0.0,
+            "fp_per_flight_hour": (cm["fp"] / hours) if hours else None,
+            **{f"prob_{k}": v for k, v in _summarize_probs(y_prob).items()},
+        }
+    if attack_results:
+        y_prob = np.concatenate([r["y_prob"] for r in attack_results])
+        y_true = np.concatenate([r["y_true"] for r in attack_results])
+        y_pred = (y_prob >= threshold).astype(int)
+        cm = _confusion(y_true, y_pred)
+        p, r, f1 = _precision_recall_f1(cm)
+        agg["attack"] = {
+            "windows": len(y_prob),
+            **cm,
+            "precision": p, "recall": r, "f1": f1,
+            **{f"prob_{k}": v for k, v in _summarize_probs(y_prob).items()},
+        }
     return agg
+
+
+def _print_aggregate_single(agg: dict[str, Any]) -> None:
+    t = agg["threshold"]
+    print(f"\n=== Aggregate @ threshold={t:.4f} ===")
+    if "benign" in agg:
+        b = agg["benign"]
+        print(f"  benign:  windows={b['windows']:>9,d}  drones={b['drones']:>3d}  "
+              f"flight={b['flight_hours']:.2f}h")
+        print(f"    TN={b['tn']:>9,d}  FP={b['fp']:>7,d}  "
+              f"FPR={b['fpr']:.3%}  "
+              f"FP/10k={b['fp_per_10k_windows']:.2f}  "
+              f"FP/drone={b['fp_per_drone']:.2f}"
+              + (f"  FP/hr={b['fp_per_flight_hour']:.3f}"
+                 if b['fp_per_flight_hour'] is not None else ""))
+        print(f"    prob mean/p95/p99/max="
+              f"{b['prob_mean']:.4f}/{b['prob_p95']:.4f}/{b['prob_p99']:.4f}/{b['prob_max']:.4f}")
+    if "attack" in agg:
+        a = agg["attack"]
+        print(f"  attack:  windows={a['windows']:>9,d}")
+        print(f"    TP={a['tp']:>9,d}  FP={a['fp']:>7,d}  "
+              f"FN={a['fn']:>7,d}  TN={a['tn']:>7,d}")
+        print(f"    P={a['precision']:.4f}  R={a['recall']:.4f}  F1={a['f1']:.4f}")
+        print(f"    prob mean/p95/p99/max="
+              f"{a['prob_mean']:.4f}/{a['prob_p95']:.4f}/{a['prob_p99']:.4f}/{a['prob_max']:.4f}")
+
+
+def _print_threshold_sweep(
+    benign_results: list[dict[str, Any]],
+    attack_results: list[dict[str, Any]],
+    thresholds: list[float],
+) -> list[dict[str, Any]]:
+    """Print compact per-threshold table. Returns the rows for JSON output."""
+    rows = [_aggregate_at_threshold(benign_results, attack_results, t) for t in thresholds]
+    if benign_results:
+        b0 = rows[0]["benign"]
+        print(f"\n=== Benign threshold sweep "
+              f"({b0['windows']:,} windows, {b0['drones']} drones, "
+              f"{b0['flight_hours']:.2f} flight-hours) ===")
+        print(f"  {'Threshold':>10s} |{'FP':>10s} {'FPR':>9s} {'FP/10k':>10s} "
+              f"{'FP/drone':>10s} {'FP/hr':>9s} | "
+              f"{'prob mean':>10s} {'p95':>8s} {'p99':>8s} {'max':>8s}")
+        print(f"  {'-'*10}-+{'-'*43}-+{'-'*36}")
+        for row in rows:
+            b = row["benign"]
+            fphr = f"{b['fp_per_flight_hour']:>9.3f}" if b['fp_per_flight_hour'] is not None else f"{'n/a':>9s}"
+            print(f"  {row['threshold']:>10.4f} |{b['fp']:>10,d} {b['fpr']:>8.3%} "
+                  f"{b['fp_per_10k_windows']:>10.2f} {b['fp_per_drone']:>10.2f} {fphr} | "
+                  f"{b['prob_mean']:>10.4f} {b['prob_p95']:>8.4f} "
+                  f"{b['prob_p99']:>8.4f} {b['prob_max']:>8.4f}")
+    if attack_results:
+        a0 = rows[0]["attack"]
+        print(f"\n=== Attack threshold sweep ({a0['windows']:,} windows) ===")
+        print(f"  {'Threshold':>10s} |{'TP':>8s} {'FP':>8s} {'FN':>8s} {'TN':>8s} | "
+              f"{'P':>7s} {'R':>7s} {'F1':>7s}")
+        print(f"  {'-'*10}-+{'-'*36}-+{'-'*24}")
+        for row in rows:
+            a = row["attack"]
+            print(f"  {row['threshold']:>10.4f} |{a['tp']:>8,d} {a['fp']:>8,d} "
+                  f"{a['fn']:>8,d} {a['tn']:>8,d} | "
+                  f"{a['precision']:>7.4f} {a['recall']:>7.4f} {a['f1']:>7.4f}")
+    return rows
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -267,8 +386,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data-dir", required=True, type=Path,
                     help="Root dir. Every **/csv/drone_*.csv under it is evaluated; "
                          "each run's class label comes from its metadata.json:attack.")
-    ap.add_argument("--threshold", type=float, default=0.5,
-                    help="Probability threshold for 0/1 decision (default 0.5).")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="Single probability threshold for 0/1 decision (default 0.5). "
+                         "Backward-compat alias for `--thresholds <one value>`.")
+    ap.add_argument("--thresholds", type=float, nargs="+", default=None,
+                    help="One or more decision thresholds. Pass multiple values to "
+                         "get a per-threshold sweep table with FP, FPR, FP/10k, "
+                         "FP/drone, and FP/flight-hour columns. Example: "
+                         "`--thresholds 0.05 0.10 0.25 0.50 0.75 0.95`.")
     ap.add_argument("--runs", nargs="*", default=None,
                     help="Optional whitelist of run-dir basenames to evaluate.")
     ap.add_argument("--json-out", type=Path, default=None,
@@ -391,8 +516,21 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nDiscovered {total_files} drone file(s) across {len(runs)} run(s) "
           f"under {data_dir}\n")
 
+    # Resolve thresholds (CLI: --thresholds list wins; --threshold single is a
+    # backward-compat alias; default is [0.5]).
+    if args.thresholds is not None:
+        thresholds = list(args.thresholds)
+    elif args.threshold is not None:
+        thresholds = [args.threshold]
+    else:
+        thresholds = [0.5]
+    primary_threshold = thresholds[0]
+    sweep_mode = len(thresholds) > 1
+
     model = tf.keras.models.load_model(str(keras_path), compile=False)
 
+    # Run every run; keep raw arrays so we can re-score at any threshold.
+    raw_results: list[dict[str, Any]] = []
     per_run: list[dict[str, Any]] = []
     for run_dir in sorted(runs):
         run_label = bilstm._run_label_from_metadata(run_dir)
@@ -405,17 +543,26 @@ def main(argv: list[str] | None = None) -> int:
             feature_columns=feature_columns, primary=primary,
             core_cols=core_cols, window_size=window_size, stride=stride,
         )
-        m = _per_run_metrics(result, args.threshold)
+        raw_results.append(result)
+        m = _per_run_metrics(result, primary_threshold)
         per_run.append(m)
         _print_per_run(m)
         if args.verbose_detection and result["windows"] > 0:
-            y_pred = (result["y_prob"] >= args.threshold).astype(int)
+            y_pred = (result["y_prob"] >= primary_threshold).astype(int)
             bilstm.print_detection_metrics(
                 Path(run_dir).name,
                 result["y_true"], result["y_prob"], y_pred, result["meta"],
             )
 
-    aggregate = _print_aggregate(per_run, args.threshold)
+    benign_results = [r for r in raw_results if r["run_label"] == "benign" and r["windows"] > 0]
+    attack_results = [r for r in raw_results if r["run_label"] == "attack" and r["windows"] > 0]
+
+    primary_agg = _aggregate_at_threshold(benign_results, attack_results, primary_threshold)
+    _print_aggregate_single(primary_agg)
+
+    sweep_rows: list[dict[str, Any]] = []
+    if sweep_mode:
+        sweep_rows = _print_threshold_sweep(benign_results, attack_results, thresholds)
 
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -427,9 +574,11 @@ def main(argv: list[str] | None = None) -> int:
             "primary_type": primary,
             "window_size": window_size,
             "stride": stride,
-            "threshold": args.threshold,
+            "thresholds": thresholds,
+            "primary_threshold": primary_threshold,
             "per_run": per_run,
-            "aggregate": aggregate,
+            "aggregate_primary": primary_agg,
+            "threshold_sweep": sweep_rows,
         }, indent=2, default=str))
         print(f"\nWrote {args.json_out}")
 
