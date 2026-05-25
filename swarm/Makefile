@@ -63,11 +63,13 @@ help:
 	@echo "  make verify-transfer SRC=<dir> CLASS=attack|benign"
 	@echo "      Re-check integrity of already-converted legacy runs (no rebuild)."
 	@echo ""
-	@echo "  make evaluate MODEL=<dir|*.keras> DATA=<runs-dir> [THRESHOLD=0.5 | THRESHOLDS=\"...\"] [RUNS=\"...\"] [JSON_OUT=path]"
+	@echo "  make evaluate MODEL=<dir|*.keras> DATA=<runs-dir> [THRESHOLDS=\"...\"] [UNSEEN=1] [JSON_OUT=path]"
 	@echo "      Score a trained biLSTM (1Layer) against arbitrary held-out runs."
 	@echo "      Per-run + aggregate metrics (full confusion matrix, prob mean/p95/p99/max)."
+	@echo "      Per-attack-type breakdown appears automatically when ≥2 attack types present."
 	@echo "      Pass THRESHOLDS=\"0.05 0.10 0.25 0.50 0.75 0.95\" for a sweep table with"
-	@echo "      FP, FPR, FP/10k windows, FP/drone, FP/flight-hour at each threshold."
+	@echo "      FP, FPR, FP/10k, FP/drone, FP/flight-hour at each threshold."
+	@echo "      Pass UNSEEN=1 to exclude runs in the manifest's train/val/test splits."
 	@echo ""
 	@echo "  Tuning knobs (any sim* target):"
 	@echo "    GCS_CONCURRENCY=8           (default 12) — max parallel /stage2 + /stage3 POSTs"
@@ -453,6 +455,7 @@ evaluate:
 	    $(if $(JSON_OUT),--json-out $(JSON_OUT)) \
 	    $(if $(WINDOW_SIZE),--window-size $(WINDOW_SIZE)) \
 	    $(if $(STRIDE),--stride $(STRIDE)) \
+	    $(if $(UNSEEN),--unseen) \
 	    $(if $(VERBOSE_DETECTION),--verbose-detection)
 
 # List archives newest first with file sizes. Shows both legacy .tar.gz

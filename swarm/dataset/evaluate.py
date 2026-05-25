@@ -110,6 +110,27 @@ def _discover_runs(data_dir: Path, run_filter: list[str] | None) -> dict[str, li
     return runs
 
 
+def _attack_type_from_metadata(run_dir: str) -> str | None:
+    """Read ``metadata.json:attack`` and return the raw string.
+
+    Examples: ``"none"`` (benign), ``"gps_spoof"``, ``"attitude_spoof"``.
+    Returns ``None`` when metadata.json is missing/unreadable so the caller
+    can skip the run cleanly. Sibling of
+    ``swarm/biLSTM-1Layer-Protocol.py::_run_label_from_metadata`` but
+    preserves the original string for per-type grouping (the trainer's
+    helper collapses every non-"none" value to ``"attack"``).
+    """
+    meta_path = Path(run_dir) / "metadata.json"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    val = meta.get("attack")
+    return str(val) if val is not None else None
+
+
 def _evaluate_run(
     run_dir: str,
     drone_files: list[Path],
@@ -388,6 +409,97 @@ def _print_threshold_sweep(
     return rows
 
 
+def _group_by_attack_type(
+    attack_results: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group attack-run results by their metadata.json:attack value."""
+    by_type: dict[str, list[dict[str, Any]]] = {}
+    for r in attack_results:
+        by_type.setdefault(r.get("attack_type", "unknown"), []).append(r)
+    return by_type
+
+
+def _per_type_metrics_at_threshold(
+    by_type: dict[str, list[dict[str, Any]]],
+    threshold: float,
+) -> list[dict[str, Any]]:
+    """Per-attack-type confusion matrix + P/R/F1 at one threshold."""
+    import numpy as np
+    rows: list[dict[str, Any]] = []
+    for attack_type in sorted(by_type):
+        results = by_type[attack_type]
+        y_prob = np.concatenate([r["y_prob"] for r in results])
+        y_true = np.concatenate([r["y_true"] for r in results])
+        y_pred = (y_prob >= threshold).astype(int)
+        cm = _confusion(y_true, y_pred)
+        p, r, f1 = _precision_recall_f1(cm)
+        rows.append({
+            "attack_type": attack_type,
+            "threshold": threshold,
+            "n_runs": len(results),
+            "windows": int(len(y_prob)),
+            **cm,
+            "precision": p, "recall": r, "f1": f1,
+            **{f"prob_{k}": v for k, v in _summarize_probs(y_prob).items()},
+        })
+    return rows
+
+
+def _print_attack_breakdown(
+    attack_results: list[dict[str, Any]],
+    threshold: float,
+) -> list[dict[str, Any]]:
+    """Per-attack-type breakdown at the primary threshold. No-op when only
+    one attack type is present (the existing aggregate already covers it).
+    Returns the JSON-friendly rows.
+    """
+    by_type = _group_by_attack_type(attack_results)
+    if len(by_type) < 1:
+        return []
+    rows = _per_type_metrics_at_threshold(by_type, threshold)
+    if len(by_type) < 2:
+        return rows  # silent — aggregate suffices for one type
+    name_w = max(len(r["attack_type"]) for r in rows)
+    print(f"\n=== Attack breakdown by type @ threshold={threshold:.4f} ===")
+    for r in rows:
+        print(
+            f"  {r['attack_type']:<{name_w}s}  runs={r['n_runs']:>3d}  "
+            f"windows={r['windows']:>9,d}  "
+            f"TP={r['tp']:>8,d} FP={r['fp']:>7,d} FN={r['fn']:>7,d} TN={r['tn']:>8,d}  "
+            f"P={r['precision']:.4f}  R={r['recall']:.4f}  F1={r['f1']:.4f}"
+        )
+    return rows
+
+
+def _print_per_type_sweep(
+    attack_results: list[dict[str, Any]],
+    thresholds: list[float],
+) -> list[dict[str, Any]]:
+    """Per-attack-type × per-threshold sweep table. Only fires for ≥2 types
+    (otherwise the aggregate attack sweep already covers it).
+    """
+    by_type = _group_by_attack_type(attack_results)
+    if len(by_type) < 2:
+        return []
+    all_rows: list[dict[str, Any]] = []
+    for t in thresholds:
+        all_rows.extend(_per_type_metrics_at_threshold(by_type, t))
+    name_w = max(len(at) for at in by_type)
+    print(f"\n=== Per-attack-type sweep ({len(by_type)} types × "
+          f"{len(thresholds)} thresholds) ===")
+    print(f"  {'threshold':>10s}  {'attack_type':<{name_w}s}  "
+          f"{'TP':>8s} {'FP':>7s} {'FN':>7s} {'TN':>8s}  "
+          f"{'P':>7s} {'R':>7s} {'F1':>7s}")
+    print(f"  {'-'*10}  {'-'*name_w}  {'-'*34}  {'-'*23}")
+    for r in all_rows:
+        print(
+            f"  {r['threshold']:>10.4f}  {r['attack_type']:<{name_w}s}  "
+            f"{r['tp']:>8,d} {r['fp']:>7,d} {r['fn']:>7,d} {r['tn']:>8,d}  "
+            f"{r['precision']:>7.4f} {r['recall']:>7.4f} {r['f1']:>7.4f}"
+        )
+    return all_rows
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__.split("\n", 1)[0],
@@ -414,6 +526,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--verbose-detection", action="store_true",
                     help="Also call the trainer's print_detection_metrics per run "
                          "(verbose: per-drone timing + FN streak stats).")
+    ap.add_argument("--unseen", action="store_true",
+                    help="Exclude any run whose basename appears in the "
+                         "manifest's train_runs/val_runs/test_runs lists. "
+                         "Use to get an unbiased eval against data the model "
+                         "never saw during training, validation, or testing.")
     ap.add_argument("--window-size", type=int, default=None,
                     help="Override the manifest's window_size. Useful when the "
                          "manifest was overwritten by a different training run "
@@ -525,6 +642,37 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    # --unseen: drop any run whose basename appears in the manifest's
+    # train/val/test sets. Matches by basename for robustness against
+    # absolute-vs-relative path differences between training-time and
+    # eval-time.
+    excluded_runs: list[str] = []
+    unseen_basenames: set[str] = set()
+    if args.unseen:
+        for key in ("train_runs", "val_runs", "test_runs"):
+            for p in manifest.get(key, []):
+                unseen_basenames.add(Path(str(p)).name)
+        kept: dict[str, list[Path]] = {}
+        for run_dir, files in runs.items():
+            name = Path(run_dir).name
+            if name in unseen_basenames:
+                excluded_runs.append(name)
+            else:
+                kept[run_dir] = files
+        if not kept:
+            print(
+                f"error: --unseen excluded all {len(runs)} candidate run(s) "
+                f"under {data_dir} (every one was in the manifest's "
+                f"train/val/test sets).\n       excluded: "
+                f"{', '.join(sorted(excluded_runs))}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"\n--unseen: manifest train/val/test = {len(unseen_basenames)} run(s); "
+              f"excluding {len(excluded_runs)} of {len(runs)} discovered "
+              f"(keeping {len(kept)})")
+        runs = kept
+
     total_files = sum(len(v) for v in runs.values())
     print(f"\nDiscovered {total_files} drone file(s) across {len(runs)} run(s) "
           f"under {data_dir}\n")
@@ -595,8 +743,13 @@ def main(argv: list[str] | None = None) -> int:
             feature_columns=feature_columns, primary=primary,
             core_cols=core_cols, window_size=window_size, stride=stride,
         )
+        # Per-attack-type breakdown needs the raw metadata.json:attack
+        # value (e.g. "gps_spoof"). bilstm._run_label_from_metadata above
+        # collapsed it to "attack"/"benign"; re-read for the full string.
+        result["attack_type"] = _attack_type_from_metadata(run_dir) or "unknown"
         raw_results.append(result)
         m = _per_run_metrics(result, primary_threshold)
+        m["attack_type"] = result["attack_type"]
         per_run.append(m)
         _print_per_run(m)
         if args.verbose_detection and result["windows"] > 0:
@@ -612,9 +765,15 @@ def main(argv: list[str] | None = None) -> int:
     primary_agg = _aggregate_at_threshold(benign_results, attack_results, primary_threshold)
     _print_aggregate_single(primary_agg)
 
+    # Per-attack-type breakdown — silent if only one attack type present
+    # (the aggregate above already conveys it). Always returns rows for JSON.
+    per_type_primary = _print_attack_breakdown(attack_results, primary_threshold)
+
     sweep_rows: list[dict[str, Any]] = []
+    per_type_sweep: list[dict[str, Any]] = []
     if sweep_mode:
         sweep_rows = _print_threshold_sweep(benign_results, attack_results, thresholds)
+        per_type_sweep = _print_per_type_sweep(attack_results, thresholds)
 
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
@@ -628,9 +787,13 @@ def main(argv: list[str] | None = None) -> int:
             "stride": stride,
             "thresholds": thresholds,
             "primary_threshold": primary_threshold,
+            "unseen_filter_applied": bool(args.unseen),
+            "excluded_runs": sorted(excluded_runs),
             "per_run": per_run,
             "aggregate_primary": primary_agg,
             "threshold_sweep": sweep_rows,
+            "per_attack_type_primary": per_type_primary,
+            "per_attack_type_sweep": per_type_sweep,
         }, indent=2, default=str))
         print(f"\nWrote {args.json_out}")
 
