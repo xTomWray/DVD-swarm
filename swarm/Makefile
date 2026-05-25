@@ -229,7 +229,11 @@ sim:
 # Iterations call swarm.sim directly (no recursive $(MAKE)) so everything lands
 # in a single coherent log file.
 
-RUNS       ?= 5
+# RUNS default applies ONLY to the multi-run sim targets below — leaving it
+# global would silently inject --runs 5 into the `transfer`, `verify-transfer`,
+# and `evaluate` targets (where RUNS is a whitelist filter, not an iteration
+# count). Target-specific binding keeps the default scoped to where it belongs.
+sim-multi sim-random sim-benign: RUNS ?= 5
 START_MIN  ?= 40
 START_MAX  ?= 70
 DUR_MIN    ?= 30
