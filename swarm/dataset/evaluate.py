@@ -200,6 +200,19 @@ def _precision_recall_f1(cm: dict[str, int]) -> tuple[float, float, float]:
     return p, r, f1
 
 
+def _infer_window_from_model(model: Any) -> int | None:
+    """Extract window_size from the Keras model's input shape.
+
+    Bidirectional LSTM input is ``(batch, timesteps, features)``; we want
+    ``timesteps`` (index 1). Returns ``None`` if the shape is unparseable
+    (e.g. nested model, dict-shaped input).
+    """
+    shape = getattr(model, "input_shape", None)
+    if isinstance(shape, tuple) and len(shape) >= 2 and isinstance(shape[1], int):
+        return int(shape[1])
+    return None
+
+
 def _flight_hours(meta_list: list[dict[str, Any]]) -> float:
     """Per-drone (max end-ts − min start-ts) summed, converted ms→hours.
 
@@ -528,6 +541,45 @@ def main(argv: list[str] | None = None) -> int:
     sweep_mode = len(thresholds) > 1
 
     model = tf.keras.models.load_model(str(keras_path), compile=False)
+
+    # The Keras model itself is the source of truth for window_size: the
+    # first hidden dim of input_shape is what every window must be reshaped
+    # to. If it disagrees with bundle/manifest/CLI, the model is right —
+    # the bundle/manifest got clobbered by a later training run sharing
+    # the same --output stem. Without this check, an incorrect window_size
+    # would either OOM on reshape or feed nonsense rows in.
+    model_window = _infer_window_from_model(model)
+    if model_window is not None and model_window != window_size:
+        cli_override = args.window_size is not None
+        if cli_override:
+            print(
+                f"WARNING: model expects window={model_window} but CLI passed "
+                f"--window-size {window_size} — keeping CLI value (you'll get "
+                f"a shape mismatch from Keras if this is wrong).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"NOTE: model's input shape says window={model_window}; "
+                f"overriding window_size={window_size} from {src} "
+                f"(bundle/manifest was clobbered by a later training run).",
+                file=sys.stderr,
+            )
+            window_size = model_window
+            # If the filename's w<N>_s<N> also matches the model, trust its
+            # stride too (more likely correct than the clobbered sidecar).
+            if fn_match:
+                fn_w, fn_s = int(fn_match.group(1)), int(fn_match.group(2))
+                if fn_w == model_window and fn_s != stride:
+                    print(
+                        f"NOTE: filename agrees with model on window={fn_w}; "
+                        f"also trusting filename's stride={fn_s} over "
+                        f"{src}'s stride={stride}.",
+                        file=sys.stderr,
+                    )
+                    stride = fn_s
+            print(f"           → using window={window_size} stride={stride}",
+                  file=sys.stderr)
 
     # Run every run; keep raw arrays so we can re-score at any threshold.
     raw_results: list[dict[str, Any]] = []
