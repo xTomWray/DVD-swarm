@@ -80,3 +80,55 @@ configs/data/raw/instance-*/
 
 logs/
 archives/
+
+
+
+# Server-side run noise — never commit
+
+.cache/
+
+swarm/.cache/
+
+nohup.out
+
+swarm/nohup.out
+
+swarm/nohup.sim-multi.log
+
+train_*.log
+
+swarm/train_*.log
+
+swarm/sweep/
+
+output_archive/
+
+*.bak
+
+
+
+# Large artifacts — tracked out-of-tree (see models/registry.yaml when added)
+
+*.keras
+
+*.joblib
+
+*.pkl
+
+swarm/batch512_1layer/
+
+independent-data/
+
+legacy-data/
+
+training-data/
+
+models/
+
+
+
+
+# Raw flight-log captures from swarm runs — too large, regenerable
+
+swarm/configs/data/raw/
+

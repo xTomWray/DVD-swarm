@@ -1,0 +1,7 @@
+numpy==2.4.6
+pandas==3.0.3
+pymavlink==2.4.49
+PyYAML==6.0.3
+Requests==2.34.2
+scikit_learn==1.8.0
+tensorflow==2.21.0
